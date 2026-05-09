@@ -23,6 +23,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #   --num_workers 8        DataLoader 并行读取 Parquet 数据的进程数
 #   "$@"                   将调用 run.sh 时附加的所有额外参数透传给 train.py，
 #                          例如：bash run.sh --batch_size 512 --lr 3e-4
+#test
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
