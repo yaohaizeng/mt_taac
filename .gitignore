@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Training / inference artifacts
+*.pt
+*.pth
+checkpoints/
+ckpt*/
+logs/
+tensorboard/
+*.log
+
+# Data (usually not versioned)
+*.parquet
+data/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Env
+.env
+.env.*
