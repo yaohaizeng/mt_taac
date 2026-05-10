@@ -1,0 +1,17 @@
+---
+description: 注释、解析或修改代码前，先读取 HyFormer-notes.md 以获取模型架构背景
+globs: **/*.py, **/*.sh
+alwaysApply: false
+---
+
+# 前置：阅读 HyFormer 架构笔记
+
+在对本项目任意代码进行**注释、解析或修改**之前，必须先用 Read 工具读取：
+
+```
+paper/HyFormer-notes.md
+```
+
+该笔记记录了 PCVRHyFormer 的核心设计：NS Tokenizer、MultiSeqHyFormerBlock、RankMixerBlock、序列编码器变体等关键模块的原理与约束，是理解代码意图的第一手参考。
+
+读取后再结合具体文件内容作业，确保注释/分析/改动与论文设计保持一致。

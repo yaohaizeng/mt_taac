@@ -685,17 +685,23 @@ def get_pcvr_data(
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
-    The validation split is taken as the last ``valid_ratio`` fraction of Row
-    Groups (in the file order returned by ``glob``).
+    切分粒度为 Parquet Row Group（而非单行），原因：
+      - Row Group 是 Parquet 的最小独立读取单元，按 RG 切分可避免跨文件随机寻址，
+        保持顺序 I/O 的高吞吐。
+      - 验证集取文件尾部 ``valid_ratio`` 比例的 RG，与训练集严格不重叠，
+        且与数据写入顺序一致，便于复现。
 
     Returns:
-        A tuple ``(train_loader, valid_loader, train_dataset)``. The third
-        element is returned so the caller can access the feature schema
-        (``user_int_schema``, ``item_int_schema``, ...) needed to construct
-        the model.
+        ``(train_loader, valid_loader, train_dataset)``。
+        返回 train_dataset 是因为调用方（train.py）需要从中读取
+        ``user_int_schema``、``item_int_schema`` 等特征元信息来构造模型。
     """
     random.seed(seed)
 
+    # ── Step 1：枚举所有 Row Group ────────────────────────────────────────────
+    # 遍历 data_dir 下的全部 *.parquet 文件，逐文件扫描其 Row Group 元数据，
+    # 构建全局 RG 列表：[(file_path, rg_index, num_rows), ...]。
+    # sorted() 保证多文件时枚举顺序确定，使 train/valid 切分可复现。
     import glob as _glob
     pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
 
@@ -703,13 +709,19 @@ def get_pcvr_data(
     for f in pq_files:
         pf = pq.ParquetFile(f)
         for i in range(pf.metadata.num_row_groups):
+            # 只读元数据（num_rows），不加载实际数据列，速度极快。
             rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
     total_rgs = len(rg_info)
 
+    # ── Step 2：计算 train / valid 的 RG 范围 ────────────────────────────────
+    # 验证集：取尾部 valid_ratio 比例的 RG，至少保留 1 个 RG。
+    # 训练集：剩余的头部 RG（[0, n_train_rgs)）。
+    # 两者以 n_train_rgs 为界，严格不重叠。
     n_valid_rgs = max(1, int(total_rgs * valid_ratio))
     n_train_rgs = total_rgs - n_valid_rgs
 
-    # train_ratio: use only the first N% of the training Row Groups.
+    # train_ratio < 1.0 时进一步缩减训练集 RG 数量，用于快速调试或小样本实验。
+    # 取前 N% 的训练 RG，保证训练集与验证集之间始终存在明确边界。
     if train_ratio < 1.0:
         n_train_rgs = max(1, int(n_train_rgs * train_ratio))
         logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
@@ -720,6 +732,11 @@ def get_pcvr_data(
     logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
                  f"{n_valid_rgs} valid ({valid_rows} rows)")
 
+    # ── Step 3：构造训练集 Dataset ────────────────────────────────────────────
+    # shuffle=True + buffer_batches：在 buffer_batches 个 batch 大小的窗口内做随机打乱。
+    # 流式读取（IterableDataset）不支持全局 shuffle，缓冲区 shuffle 是工程上的折中方案：
+    # buffer_batches 越大随机性越好，但同时占用更多内存。
+    # row_group_range=(0, n_train_rgs) 限定只读取训练 RG，不越界到验证集。
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -731,6 +748,11 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
     )
 
+    # ── Step 4：构造训练 DataLoader ───────────────────────────────────────────
+    # batch_size=None：IterableDataset 内部已按 batch_size 分批，DataLoader 不再重新分批。
+    # pin_memory=True（CUDA 可用时）：将 CPU tensor 锁页，加速 Host→GPU 传输。
+    # persistent_workers=True：worker 进程在 epoch 间保持存活，避免反复 fork 的开销。
+    # prefetch_factor=2：每个 worker 预取 2 个 batch，隐藏 I/O 延迟。
     use_cuda = torch.cuda.is_available()
     _train_kw = {}
     if num_workers > 0:
@@ -742,6 +764,12 @@ def get_pcvr_data(
         num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
     )
 
+    # ── Step 5：构造验证集 Dataset & DataLoader ───────────────────────────────
+    # shuffle=False, buffer_batches=0：验证集需要完整、有序地过一遍，不做任何随机化，
+    # 保证每次评估结果一致且可与其他 checkpoint 直接比较。
+    # row_group_range=(n_train_rgs, total_rgs)：取训练集之后的全部 RG 作为验证集。
+    # num_workers=0：验证通常在 epoch 末尾串行执行，多进程反而增加启动开销；
+    # 且验证集不需要 prefetch，单进程读取足够。
     valid_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
