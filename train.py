@@ -160,6 +160,14 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    # use_time_features：从样本级 timestamp 派生 5 个请求时刻特征
+    # (hour_sin, hour_cos, dow_sin, dow_cos, is_weekend)，追加到 user_dense_feats 末尾。
+    # 开启后 user_dense_dim 自动扩大 5，模型 Dense FFN 输入维度随之调整，无需其他改动。
+    parser.add_argument('--use_time_features', action='store_true', default=True,
+                        help='Append 5 request-time features (hour_sin/cos, '
+                             'dow_sin/cos, is_weekend) to user_dense_feats (default on)')
+    parser.add_argument('--no_time_features', dest='use_time_features', action='store_false',
+                        help='Disable request-time features')
     # rank_mixer_mode 控制 RankMixerBlock 的工作模式：
     #   full     — token mixing（跨 token 信息交换）+ per-token FFN，需满足 d_model % T == 0；
     #   ffn_only — 仅 per-token FFN，无 token mixing 约束；
@@ -314,6 +322,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        use_time_features=args.use_time_features,
     )
 
     # ── NS 分组解析 ───────────────────────────────────────────────────────────

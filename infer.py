@@ -332,6 +332,11 @@ def main() -> None:
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
 
+    # use_time_features 必须与训练时保持一致，否则 user_dense_dim 不同会导致
+    # state_dict 加载时 shape 不匹配。从 train_config.json 读取，默认 True。
+    use_time_features = bool(train_config.get('use_time_features', True))
+    logging.info(f"use_time_features: {use_time_features}")
+
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -340,6 +345,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        use_time_features=use_time_features,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

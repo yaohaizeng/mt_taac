@@ -131,6 +131,21 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# ─────────────────────────── Request-time Features ───────────────────────────
+# 从样本级 timestamp（请求时刻，秒级 Unix 时间戳）派生的上下文时间特征，
+# 追加到 user_dense_feats 末尾，帮助模型捕捉早晚高峰、工作日/周末等周期性规律。
+#
+# hour_sin / hour_cos：小时（0-23）的 sin/cos 双分量编码，保留 23→0 的周期连续性。
+# dow_sin  / dow_cos ：星期几（0=周一，6=周日）的 sin/cos 双分量编码。
+# is_weekend         ：0/1 二值，显式标识是否为周末。
+#
+# 取值范围：sin/cos ∈ [-1, 1]，is_weekend ∈ {0.0, 1.0}
+_TIME_FEATURES = ['hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'is_weekend']
+TIME_FEATURE_DIM = len(_TIME_FEATURES)   # = 5，追加到 user_dense_feats 末尾
+# 合成 fid（9001-9005），用于在 FeatureSchema 中登记时间特征条目；
+# 选取远离真实 fid 范围的数值，避免与 schema.json 中的真实 fid 冲突。
+_TIME_FID_BASE = 9001
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -153,6 +168,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        use_time_features: bool = True,
     ) -> None:
         """
         Args:
@@ -170,6 +186,9 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            use_time_features: if True, append TIME_FEATURE_DIM extra float dims
+                (hour_sin/cos, dow_sin/cos, is_weekend) to user_dense_feats,
+                derived from the sample-level ``timestamp`` column.
         """
         super().__init__()
 
@@ -207,6 +226,21 @@ class PCVRParquetDataset(IterableDataset):
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+
+        # ── 时间特征扩展（在 buffer 分配前完成，total_dim 自动含时间特征维度）──
+        # 扩展后 train.py 读取 user_dense_schema.total_dim 即含时间特征，
+        # 模型 Dense FFN 输入维度随之自动调整，无需修改模型代码。
+        # _time_feature_offset = -1 表示未启用；_convert_batch 依此决定是否写入。
+        self._use_time_features = use_time_features
+        self._time_feature_offset: int = -1
+        if use_time_features:
+            self._time_feature_offset = self.user_dense_schema.total_dim
+            for i in range(TIME_FEATURE_DIM):
+                self.user_dense_schema.add(_TIME_FID_BASE + i, 1)
+            logging.info(
+                f"Time features enabled: {_TIME_FEATURES}, "
+                f"user_dense_dim expanded to {self.user_dense_schema.total_dim}"
+            )
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -570,6 +604,22 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- 时间特征（追加到 user_dense 末尾的 5 个 float 槽）────────────────
+        # timestamps 是样本级请求时刻（秒级 Unix 时间戳），已在 meta 段读取。
+        # hour：一天中第几小时（0-23）；dow：星期几（0=周一，6=周日）。
+        # sin/cos 双分量编码使 hour=23 与 hour=0 在向量空间中保持连续，
+        # 避免线性编码的首尾跳变（如用 hour/23 做特征，23 与 0 距离为 1 而非 0）。
+        if self._time_feature_offset >= 0:
+            off = self._time_feature_offset
+            hour = ((timestamps // 3600) % 24).astype(np.float32)
+            # Unix epoch（1970-01-01）是周四，+4 使 dow=0 对齐周一
+            dow  = ((timestamps // 86400 + 4) % 7).astype(np.float32)
+            user_dense[:B, off + 0] = np.sin(2 * np.pi * hour / 24)   # hour_sin
+            user_dense[:B, off + 1] = np.cos(2 * np.pi * hour / 24)   # hour_cos
+            user_dense[:B, off + 2] = np.sin(2 * np.pi * dow  / 7)    # dow_sin
+            user_dense[:B, off + 3] = np.cos(2 * np.pi * dow  / 7)    # dow_cos
+            user_dense[:B, off + 4] = (dow >= 5).astype(np.float32)   # is_weekend
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
@@ -681,6 +731,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    use_time_features: bool = True,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -746,6 +797,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        use_time_features=use_time_features,
     )
 
     # ── Step 4：构造训练 DataLoader ───────────────────────────────────────────
@@ -779,6 +831,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        use_time_features=use_time_features,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
