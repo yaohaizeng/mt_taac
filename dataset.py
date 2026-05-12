@@ -169,6 +169,7 @@ class PCVRParquetDataset(IterableDataset):
         clip_vocab: bool = True,
         is_training: bool = True,
         use_time_features: bool = True,
+        use_time_ns: bool = True,
     ) -> None:
         """
         Args:
@@ -189,6 +190,9 @@ class PCVRParquetDataset(IterableDataset):
             use_time_features: if True, append TIME_FEATURE_DIM extra float dims
                 (hour_sin/cos, dow_sin/cos, is_weekend) to user_dense_feats,
                 derived from the sample-level ``timestamp`` column.
+            use_time_ns: if True, additionally emit discrete request-time ids
+                ``time_feats[:, 0]=hour(1..24)``, ``time_feats[:, 1]=dow(1..7)``
+                for a dedicated time NS token on the model side.
         """
         super().__init__()
 
@@ -207,6 +211,7 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self._use_time_ns = use_time_ns
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -631,6 +636,14 @@ class PCVRParquetDataset(IterableDataset):
             '_seq_domains': self.seq_domains,
         }
 
+        # 离散时间特征（hour / day-of-week），供模型构造专用 time NS token。
+        # 索引从 1 开始，保留 0 作为 padding/unknown。
+        if self._use_time_ns:
+            hour_idx = ((timestamps // 3600) % 24 + 1).astype(np.int64)      # 1..24
+            dow_idx = ((timestamps // 86400 + 4) % 7 + 1).astype(np.int64)   # 1..7 (Mon=1)
+            time_feats = np.stack([hour_idx, dow_idx], axis=1)               # (B, 2)
+            result['time_feats'] = torch.from_numpy(time_feats)
+
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
@@ -732,6 +745,7 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     use_time_features: bool = True,
+    use_time_ns: bool = True,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -798,6 +812,7 @@ def get_pcvr_data(
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
         use_time_features=use_time_features,
+        use_time_ns=use_time_ns,
     )
 
     # ── Step 4：构造训练 DataLoader ───────────────────────────────────────────
@@ -832,6 +847,7 @@ def get_pcvr_data(
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
         use_time_features=use_time_features,
+        use_time_ns=use_time_ns,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

@@ -168,6 +168,12 @@ def parse_args() -> argparse.Namespace:
                              'dow_sin/cos, is_weekend) to user_dense_feats (default on)')
     parser.add_argument('--no_time_features', dest='use_time_features', action='store_false',
                         help='Disable request-time features')
+    # use_time_ns：在保留连续时间特征的基础上，额外添加离散时间 NS token
+    # （hour id + day-of-week id -> Embedding -> 1 个独立 time NS token）。
+    parser.add_argument('--use_time_ns', action='store_true', default=True,
+                        help='Enable one extra discrete time NS token (default on)')
+    parser.add_argument('--no_time_ns', dest='use_time_ns', action='store_false',
+                        help='Disable discrete time NS token')
     # rank_mixer_mode 控制 RankMixerBlock 的工作模式：
     #   full     — token mixing（跨 token 信息交换）+ per-token FFN，需满足 d_model % T == 0；
     #   ffn_only — 仅 per-token FFN，无 token mixing 约束；
@@ -323,6 +329,7 @@ def main() -> None:
         seed=args.seed,
         seq_max_lens=seq_max_lens,
         use_time_features=args.use_time_features,
+        use_time_ns=args.use_time_ns,
     )
 
     # ── NS 分组解析 ───────────────────────────────────────────────────────────
@@ -442,6 +449,8 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        # 离散时间 NS token 开关（叠加于连续时间特征之上）
+        "use_time_ns": args.use_time_ns,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

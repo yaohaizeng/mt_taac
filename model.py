@@ -13,6 +13,7 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
+    time_feats: Optional[torch.Tensor]  # (B, 2), [hour(1..24), dow(1..7)]
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
@@ -1189,6 +1190,33 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class TimeNSTokenizer(nn.Module):
+    """Build one dedicated NS token from discrete request-time ids.
+
+    Expected input ``time_feats`` has shape ``(B, 2)`` with:
+      - ``time_feats[:, 0]``: hour id in [1, 24] (0 reserved for unknown)
+      - ``time_feats[:, 1]``: day-of-week id in [1, 7] (0 reserved for unknown)
+    """
+
+    def __init__(self, emb_dim: int, d_model: int) -> None:
+        super().__init__()
+        self.hour_emb = nn.Embedding(25, emb_dim, padding_idx=0)  # 0..24
+        self.dow_emb = nn.Embedding(8, emb_dim, padding_idx=0)    # 0..7
+        self.time_proj = nn.Sequential(
+            nn.Linear(emb_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, time_feats: torch.Tensor) -> torch.Tensor:
+        if time_feats.dim() != 2 or time_feats.shape[1] != 2:
+            raise ValueError(
+                f"time_feats must have shape (B, 2), got {tuple(time_feats.shape)}")
+        hour_ids = time_feats[:, 0].long().clamp(min=0, max=24)
+        dow_ids = time_feats[:, 1].long().clamp(min=0, max=7)
+        time_emb = self.hour_emb(hour_ids) + self.dow_emb(dow_ids)  # (B, emb_dim)
+        return F.silu(self.time_proj(time_emb)).unsqueeze(1)  # (B, 1, d_model)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1229,6 +1257,7 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        use_time_ns: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1273,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_time_ns = use_time_ns
 
         # ================== NS Tokens Construction ==================
 
@@ -1311,9 +1341,14 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # Optional request-time discrete token.
+        if self.use_time_ns:
+            self.time_ns_tokenizer = TimeNSTokenizer(emb_dim=emb_dim, d_model=d_model)
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (1 if self.use_time_ns else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1645,6 +1680,12 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        if self.use_time_ns:
+            if inputs.time_feats is None:
+                time_tok = user_ns.new_zeros(user_ns.shape[0], 1, self.d_model)
+            else:
+                time_tok = self.time_ns_tokenizer(inputs.time_feats)
+            ns_parts.append(time_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1688,6 +1729,12 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        if self.use_time_ns:
+            if inputs.time_feats is None:
+                time_tok = user_ns.new_zeros(user_ns.shape[0], 1, self.d_model)
+            else:
+                time_tok = self.time_ns_tokenizer(inputs.time_feats)
+            ns_parts.append(time_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 

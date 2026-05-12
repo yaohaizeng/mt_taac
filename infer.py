@@ -68,6 +68,7 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    'use_time_ns': True,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -297,6 +298,7 @@ def _batch_to_model_input(
         item_int_feats=device_batch['item_int_feats'],
         user_dense_feats=device_batch['user_dense_feats'],
         item_dense_feats=device_batch['item_dense_feats'],
+        time_feats=device_batch.get('time_feats'),
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
@@ -335,7 +337,9 @@ def main() -> None:
     # use_time_features 必须与训练时保持一致，否则 user_dense_dim 不同会导致
     # state_dict 加载时 shape 不匹配。从 train_config.json 读取，默认 True。
     use_time_features = bool(train_config.get('use_time_features', True))
+    use_time_ns = bool(train_config.get('use_time_ns', True))
     logging.info(f"use_time_features: {use_time_features}")
+    logging.info(f"use_time_ns: {use_time_ns}")
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -346,6 +350,7 @@ def main() -> None:
         buffer_batches=0,
         is_training=False,
         use_time_features=use_time_features,
+        use_time_ns=use_time_ns,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

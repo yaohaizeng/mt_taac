@@ -9,8 +9,9 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
 # ---- 当前激活配置：RankMixer NS Tokenizer（无需 ns_groups.json）----
 # 用 RankMixer 模式将 NS（Non-Sequential）特征切分为等长 token：
-#   - 将所有 User 侧整型 Embedding 拼接后均匀切成 5 个 token（--user_ns_tokens 5）
+#   - 将所有 User 侧整型 Embedding 拼接后均匀切成 4 个 token（--user_ns_tokens 4）
 #   - 将所有 Item 侧整型 Embedding 拼接后均匀切成 2 个 token（--item_ns_tokens 2）
+#   - 额外启用 1 个离散时间 NS token（由 hour/dow 离散 Embedding 生成）
 # 该模式不依赖 ns_groups.json，适合快速启动或无分组配置文件的场景。
 #
 # 关键超参说明：
@@ -25,7 +26,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #                          例如：bash run.sh --batch_size 512 --lr 3e-4
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 5 \
+    --user_ns_tokens 4 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
