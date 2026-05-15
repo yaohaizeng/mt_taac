@@ -17,6 +17,8 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_hour: dict        # {domain: tensor [B, L]}, per-position hour id 1..24 (0=pad)
+    seq_dow: dict         # {domain: tensor [B, L]}, per-position dow id 1..7  (0=pad)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1258,6 +1260,7 @@ class PCVRHyFormer(nn.Module):
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
         use_time_ns: bool = True,
+        use_seq_time_ns: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1274,6 +1277,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_time_ns = use_time_ns
+        self.use_seq_time_ns = use_seq_time_ns
 
         # ================== NS Tokens Construction ==================
 
@@ -1411,6 +1415,15 @@ class PCVRHyFormer(nn.Module):
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+
+        # ================== Sequence-side Absolute Time Embedding (optional) ==================
+        # 在序列内每条历史行为的 token 上叠加"该行为发生时刻的绝对 hour / dow"信号。
+        # 与 time_embedding（相对时效）正交；所有序列域共享同一对 Embedding，
+        # 与 time_embedding 的共享策略一致。
+        # 词表：hour 25 槽（1-24，0=pad），dow 8 槽（1-7，0=pad）。
+        if self.use_seq_time_ns:
+            self.seq_hour_embedding = nn.Embedding(25, d_model, padding_idx=0)
+            self.seq_dow_embedding = nn.Embedding(8, d_model, padding_idx=0)
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1584,6 +1597,8 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        seq_hour_ids: Optional[torch.Tensor] = None,
+        seq_dow_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1605,6 +1620,13 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        # Add per-position absolute hour / dow embeddings (padding_idx=0 → zero vec).
+        if self.use_seq_time_ns:
+            if seq_hour_ids is not None:
+                token_emb = token_emb + self.seq_hour_embedding(seq_hour_ids)
+            if seq_dow_ids is not None:
+                token_emb = token_emb + self.seq_dow_embedding(seq_dow_ids)
 
         return token_emb
 
@@ -1697,7 +1719,9 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                seq_hour_ids=inputs.seq_hour.get(domain) if inputs.seq_hour else None,
+                seq_dow_ids=inputs.seq_dow.get(domain) if inputs.seq_dow else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1745,7 +1769,9 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                seq_hour_ids=inputs.seq_hour.get(domain) if inputs.seq_hour else None,
+                seq_dow_ids=inputs.seq_dow.get(domain) if inputs.seq_dow else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

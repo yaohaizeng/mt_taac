@@ -170,6 +170,7 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         use_time_features: bool = True,
         use_time_ns: bool = True,
+        use_seq_time_ns: bool = True,
     ) -> None:
         """
         Args:
@@ -193,6 +194,11 @@ class PCVRParquetDataset(IterableDataset):
             use_time_ns: if True, additionally emit discrete request-time ids
                 ``time_feats[:, 0]=hour(1..24)``, ``time_feats[:, 1]=dow(1..7)``
                 for a dedicated time NS token on the model side.
+            use_seq_time_ns: if True, derive per-position absolute hour(1..24) /
+                day-of-week(1..7) from each behavior's own timestamp and emit
+                ``{domain}_seq_hour`` / ``{domain}_seq_dow`` of shape (B, L).
+                The model adds these as extra per-position embeddings on top of
+                the existing time-delta bucket embedding (no new NS token).
         """
         super().__init__()
 
@@ -212,6 +218,7 @@ class PCVRParquetDataset(IterableDataset):
         self.clip_vocab = clip_vocab
         self.is_training = is_training
         self._use_time_ns = use_time_ns
+        self._use_seq_time_ns = use_seq_time_ns
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -729,6 +736,24 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
+            # 序列侧绝对时间特征：每条历史行为自身发生时刻的 hour(1-24)、dow(1-7)。
+            # 与 time_bucket（行为距请求时刻的时间差桶）正交：
+            #   - time_bucket   ：相对时效，"多久前发生"
+            #   - seq_hour/dow  ：绝对时点，"在星期几的几点发生"
+            # 索引从 1 开始，0 保留为 padding（与序列 padding/无时间戳保持一致）。
+            if self._use_seq_time_ns:
+                if ts_ci is not None:
+                    seq_hour = ((ts_padded // 3600) % 24 + 1).astype(np.int64)
+                    seq_dow = ((ts_padded // 86400 + 4) % 7 + 1).astype(np.int64)
+                    seq_hour[ts_padded == 0] = 0
+                    seq_dow[ts_padded == 0] = 0
+                else:
+                    # 该 domain 无时间戳列，整张全填 0（模型侧 padding_idx=0 输出零向量）
+                    seq_hour = np.zeros((B, max_len), dtype=np.int64)
+                    seq_dow = np.zeros((B, max_len), dtype=np.int64)
+                result[f'{domain}_seq_hour'] = torch.from_numpy(seq_hour)
+                result[f'{domain}_seq_dow'] = torch.from_numpy(seq_dow)
+
         return result
 
 
@@ -746,6 +771,7 @@ def get_pcvr_data(
     seq_max_lens: Optional[Dict[str, int]] = None,
     use_time_features: bool = True,
     use_time_ns: bool = True,
+    use_seq_time_ns: bool = True,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -813,6 +839,7 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         use_time_features=use_time_features,
         use_time_ns=use_time_ns,
+        use_seq_time_ns=use_seq_time_ns,
     )
 
     # ── Step 4：构造训练 DataLoader ───────────────────────────────────────────
@@ -848,6 +875,7 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         use_time_features=use_time_features,
         use_time_ns=use_time_ns,
+        use_seq_time_ns=use_seq_time_ns,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

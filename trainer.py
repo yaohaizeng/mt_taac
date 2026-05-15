@@ -343,6 +343,9 @@ class PCVRHyFormerRankingTrainer:
 
             self._handle_validation_result(total_step, val_auc, val_logloss)
 
+            # Save a per-epoch checkpoint regardless of whether it is the best.
+            self._save_step_checkpoint(total_step, is_best=False)
+
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")
                 break
@@ -381,6 +384,8 @@ class PCVRHyFormerRankingTrainer:
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
+        seq_hour: Dict[str, torch.Tensor] = {}
+        seq_dow: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -389,6 +394,10 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
+            if f'{domain}_seq_hour' in device_batch:
+                seq_hour[domain] = device_batch[f'{domain}_seq_hour']
+            if f'{domain}_seq_dow' in device_batch:
+                seq_dow[domain] = device_batch[f'{domain}_seq_dow']
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
@@ -398,6 +407,8 @@ class PCVRHyFormerRankingTrainer:
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            seq_hour=seq_hour,
+            seq_dow=seq_dow,
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
