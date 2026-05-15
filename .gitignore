@@ -31,3 +31,17 @@ data/
 # Env
 .env
 .env.*
+
+# TAAC2026 CLI / Taiji local artifacts (regenerate with hyper_log/make_code_zip.sh + submit)
+outputs/
+
+# TAAC2026 CLI scrape browser profile (may contain session data)
+hyper_log/scrape_ref/
+
+# Taiji credentials (never commit)
+hyper_log/taiji-cookie.txt
+hyper_log/secrets/
+
+# Local Taiji submit bundles (regenerate with zip command in hyper_log/SUBMIT_commands.md)
+hyper_log/code_iteration*.zip
+hyper_log/submit_bundle_iter*/

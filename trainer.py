@@ -50,6 +50,7 @@ class PCVRHyFormerRankingTrainer:
         focal_gamma: float = 2.0,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
+        dense_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
         reinit_cardinality_threshold: int = 0,
         ckpt_params: Optional[Dict[str, Any]] = None,
@@ -80,17 +81,20 @@ class PCVRHyFormerRankingTrainer:
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
-            logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr})")
+            logging.info(
+                f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters "
+                f"(AdamW lr={lr}, weight_decay={dense_weight_decay})"
+            )
             self.sparse_optimizer = torch.optim.Adagrad(
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
             self.dense_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-                dense_params, lr=lr, betas=(0.9, 0.98)
+                dense_params, lr=lr, betas=(0.9, 0.98), weight_decay=dense_weight_decay
             )
         else:
             self.sparse_optimizer = None
             self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98)
+                model.parameters(), lr=lr, betas=(0.9, 0.98), weight_decay=dense_weight_decay
             )
 
         self.num_epochs: int = num_epochs
@@ -104,6 +108,7 @@ class PCVRHyFormerRankingTrainer:
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
         self.sparse_weight_decay: float = sparse_weight_decay
+        self.dense_weight_decay: float = dense_weight_decay
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
@@ -342,6 +347,9 @@ class PCVRHyFormerRankingTrainer:
                 self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
 
             self._handle_validation_result(total_step, val_auc, val_logloss)
+
+            # Save a per-epoch checkpoint regardless of whether it is the best.
+            self._save_step_checkpoint(total_step, is_best=False)
 
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")

@@ -207,6 +207,8 @@ def parse_args() -> argparse.Namespace:
                         help='Learning rate for sparse parameters (Adagrad over Embeddings)')
     parser.add_argument('--sparse_weight_decay', type=float, default=0.0,
                         help='Weight decay for sparse parameters (Adagrad over Embeddings)')
+    parser.add_argument('--dense_weight_decay', type=float, default=0.0,
+                        help='Weight decay for dense parameters (AdamW over non-Embedding tensors)')
     # reinit_sparse_after_epoch：从第 N 个 epoch 起，每轮结束后对高基数 Embedding 做冷重启，
     # 重置参数并重建 Adagrad 状态，防止高基数特征因记忆训练集而过拟合。
     # 参考：KuaiShou MultiEpoch（arxiv 2305.19531）。
@@ -497,6 +499,7 @@ def main() -> None:
         focal_gamma=args.focal_gamma,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
+        dense_weight_decay=args.dense_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
         reinit_cardinality_threshold=args.reinit_cardinality_threshold,
         ckpt_params=ckpt_params,
