@@ -1,5 +1,5 @@
 #!/bin/bash
-# 生成「另一条优化方向」单独提交目录（加深 HyFormer，与迭代02修复假设不同）。
+# 迭代04-A：向 baseline 优化对齐 + 轻度 dropout（submit_bundle_iter04_mild）
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="${HOME}/.local/bin:${PATH}"
@@ -9,15 +9,17 @@ URL='https://taiji.algo.qq.com/training/ckpt/angel_training_ams_2026_10297355547
 
 [[ -f "$ZIP" ]] || { echo "缺少 $ZIP，请先: bash hyper_log/make_code_zip.sh $ZIP"; exit 1; }
 
+chmod +x "${ROOT}/hyper_log/bundle_E_iter04_mild/run.sh"
+
 taac2026 prepare-submit \
   --template-job-url "$URL" \
   --zip "$ZIP" \
   --config "$CFG" \
-  --run-sh "${ROOT}/hyper_log/bundle_B_depth/run.sh" \
-  --name taac_baseline_alt_depth3_v2 \
-  --description '对照深度v2：3xHyFormer + batch_size=160（修复106475 CUDA OOM），lr/sparse/dropout同向微调，解压code.zip' \
+  --run-sh "${ROOT}/hyper_log/bundle_E_iter04_mild/run.sh" \
+  --name taac_baseline_iter04_mild \
+  --description '迭代04-A：对齐ns time lr/sparse/wd，dropout0.02轻正则；修正iter03过重正则低估评测AUC' \
   --run \
   --allow-dirty \
-  --out "${ROOT}/hyper_log/submit_bundle_alt_depth"
+  --out "${ROOT}/hyper_log/submit_bundle_iter04_mild"
 
-echo "OK: ${ROOT}/hyper_log/submit_bundle_alt_depth"
+echo "OK: ${ROOT}/hyper_log/submit_bundle_iter04_mild"

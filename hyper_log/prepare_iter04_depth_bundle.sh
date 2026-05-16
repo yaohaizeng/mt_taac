@@ -1,5 +1,5 @@
 #!/bin/bash
-# 迭代03-B：3-block + batch176 + 与03-A 对齐的正则，对应 submit_bundle_iter03_depth
+# 迭代04-B：3-block + baseline式优化器 + batch192（submit_bundle_iter04_depth）
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="${HOME}/.local/bin:${PATH}"
@@ -9,17 +9,17 @@ URL='https://taiji.algo.qq.com/training/ckpt/angel_training_ams_2026_10297355547
 
 [[ -f "$ZIP" ]] || { echo "缺少 $ZIP，请先: bash hyper_log/make_code_zip.sh $ZIP"; exit 1; }
 
-chmod +x "${ROOT}/hyper_log/bundle_D_iter03_depth/run.sh"
+chmod +x "${ROOT}/hyper_log/bundle_F_iter04_depth/run.sh"
 
 taac2026 prepare-submit \
   --template-job-url "$URL" \
   --zip "$ZIP" \
   --config "$CFG" \
-  --run-sh "${ROOT}/hyper_log/bundle_D_iter03_depth/run.sh" \
-  --name taac_baseline_iter03_depth3 \
-  --description '迭代03-B：3xHyFormer batch176 OOM则改160；wd0.02/drop0.06/lr8e-5 与03-A同向，对照容量' \
+  --run-sh "${ROOT}/hyper_log/bundle_F_iter04_depth/run.sh" \
+  --name taac_baseline_iter04_depth \
+  --description '迭代04-B：3xHyFormer batch192（OOM改176）；lr1e-4/sparse0.05/drop0.01/wd0 对齐ns time，修正iter03深度+强正则' \
   --run \
   --allow-dirty \
-  --out "${ROOT}/hyper_log/submit_bundle_iter03_depth"
+  --out "${ROOT}/hyper_log/submit_bundle_iter04_depth"
 
-echo "OK: ${ROOT}/hyper_log/submit_bundle_iter03_depth"
+echo "OK: ${ROOT}/hyper_log/submit_bundle_iter04_depth"

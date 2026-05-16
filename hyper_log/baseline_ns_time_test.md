@@ -21,6 +21,18 @@
 | **LogLoss/valid 低谷** | **≈ 0.22578**（同 step 一带） |
 | 现象 | 峰值后验证 AUC 仍缓慢回落（与多数长跑一致），最佳 ckpt 宜取峰附近 |
 
+## Model Evaluation（线上评测，`best_model`）
+
+以下为同一评测链路下的结果口径示例（数值以后台为准）；说明 **训练集验证 AUC 与线上评测 AUC 不可直连**，应以评测为准。
+
+| 训练作业（Job Name） | 评测 AUC |
+|----------------------|----------|
+| **`ns time test`（baseline）** | **0.846668** |
+| `taac_baseline_iter03_reg` | 0.84601 |
+| `taac_baseline_iter03_depth3` | 0.844648 |
+
+`iter03` 两条均低于 baseline：**过重正则 + 偏低学习率** 易导致 **欠拟合**，评测分布上吃亏；深度任务另受 **batch 变小 + 优化更难** 拖累。对策见仓库 **`迭代02修复与提交说明.md`** 中的 **迭代04**。
+
 ## 最佳 Checkpoint（抓取列表）
 
 `outputs/taiji-output/training/all-checkpoints.csv`：
