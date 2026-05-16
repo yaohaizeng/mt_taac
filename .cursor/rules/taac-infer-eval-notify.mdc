@@ -1,0 +1,25 @@
+---
+description: When infer.py changes in taac_baseline, remind about Model Evaluation sync and regenerate infer snapshot.
+globs: infer.py
+alwaysApply: false
+---
+
+# TAAC `infer.py` 与评测同步
+
+When editing **`infer.py`** in this workspace (**taac_baseline**, branch often **`tuning_hyperpara`**):
+
+1. **Tell the user explicitly** that Model Evaluation / Taiji 评测容器若仍使用旧副本，需同步更新 **`infer.py`**，且 **`dataset.py` / `model.py` / `utils.py`** 须与训练 **`code.zip` 同源 commit**，否则 strict load 或 tensor 形状可能失败。
+2. **Run or instruct** regeneration of the standalone snapshot:
+   - `bash hyper_log/snapshot_infer_for_eval.sh`
+   - 产物：`hyper_log/dist/infer_eval_snapshot.py`
+3. **Point to** `hyper_log/infer_eval说明.md` for iter04-A/B 共用推理与前提条件。
+
+Do not silently assume only `infer.py` needs to change when training code drifted.
+
+1. **Tell the user explicitly** that Model Evaluation / Taiji 评测容器若仍使用旧副本，需同步更新 **`infer.py`**，且 **`dataset.py` / `model.py` / `utils.py`** 须与训练 **`code.zip` 同源 commit**，否则 strict load 或 tensor 形状可能失败。
+2. **Run or instruct** regeneration of the standalone snapshot:
+   - `bash hyper_log/snapshot_infer_for_eval.sh`
+   - 产物：`hyper_log/dist/infer_eval_snapshot.py`
+3. **Point to** `hyper_log/infer_eval说明.md` for iter04-A/B 共用推理与前提条件。
+
+Do not silently assume only `infer.py` needs to change when training code drifted.
