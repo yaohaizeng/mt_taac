@@ -170,6 +170,9 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         use_time_features: bool = True,
         use_time_ns: bool = True,
+        split_user_dense: bool = False,
+        user_ue_fids: Optional[List[int]] = None,
+        user_pair_fids: Optional[List[int]] = None,
     ) -> None:
         """
         Args:
@@ -193,6 +196,23 @@ class PCVRParquetDataset(IterableDataset):
             use_time_ns: if True, additionally emit discrete request-time ids
                 ``time_feats[:, 0]=hour(1..24)``, ``time_feats[:, 1]=dow(1..7)``
                 for a dedicated time NS token on the model side.
+            split_user_dense: if True, split user_dense_feats into two streams:
+                ① UE branch (``user_ue_fids`` + appended time features) remains
+                   in ``user_dense_feats`` and is projected via ``user_dense_proj``;
+                ② paired branch (``user_pair_fids``) is removed from
+                   ``user_dense_feats`` and emitted as ``user_int_weights``
+                   aligned to ``user_int_feats``' layout, so the user-int
+                   tokenizer can do weighted-mean pooling instead of plain mean.
+                Default False preserves backward compatibility.
+            user_ue_fids: list of dense fids treated as User Embedding when
+                ``split_user_dense=True``. fids not present in the schema are
+                silently skipped (with a warning). Ignored when split is off.
+            user_pair_fids: list of dense fids paired with same-fid user_int
+                features when ``split_user_dense=True``. Their dense values are
+                routed to ``user_int_weights`` and serve as weights of the
+                weighted-mean pooling inside user-int tokenizer. fids missing
+                from either the user_int or user_dense schema are silently
+                skipped (with a warning). Ignored when split is off.
         """
         super().__init__()
 
@@ -212,6 +232,12 @@ class PCVRParquetDataset(IterableDataset):
         self.clip_vocab = clip_vocab
         self.is_training = is_training
         self._use_time_ns = use_time_ns
+        # user_dense split configuration; _user_pair_fids drives the weighting
+        # logic in _convert_batch and is also exposed for downstream consumers
+        # to know which fids carry semantic pair weights.
+        self._split_user_dense = split_user_dense
+        self._user_ue_fids = set(user_ue_fids or [])
+        self._user_pair_fids = set(user_pair_fids or [])
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -282,12 +308,54 @@ class PCVRParquetDataset(IterableDataset):
             self._item_int_plan.append((ci, dim, offset, vs))
             offset += dim
 
+        # user_dense plan: skip fids routed to the paired stream so the
+        # buffer offsets match the (already filtered) ``user_dense_schema``.
         self._user_dense_plan = []
         offset = 0
         for fid, dim in self._user_dense_cols:
+            if fid in self._effective_paired_fids:
+                continue
             ci = self._col_idx.get(f'user_dense_feats_{fid}')
             self._user_dense_plan.append((ci, dim, offset))
             offset += dim
+
+        # Paired-dense plan: for each paired fid, record (ci_dense, dense_dim,
+        # user_int_offset, user_int_length) so we can pad the dense float
+        # column directly into the user_int-aligned weight buffer.
+        # If the same fid does not exist in user_int_schema we skip it (and
+        # warn) -- without a matching int feature there is nothing to weight.
+        self._user_pair_plan: List[Tuple[Optional[int], int, int, int]] = []
+        if self._split_user_dense and self._effective_paired_fids:
+            user_int_fid_to_entry = self.user_int_schema._fid_to_entry
+            for fid, dim in self._user_dense_cols:
+                if fid not in self._effective_paired_fids:
+                    continue
+                if fid not in user_int_fid_to_entry:
+                    logging.warning(
+                        f"paired fid {fid}: not present in user_int schema; "
+                        f"dense values will be discarded.")
+                    continue
+                ci_dense = self._col_idx.get(f'user_dense_feats_{fid}')
+                if ci_dense is None:
+                    logging.warning(
+                        f"paired fid {fid}: parquet column user_dense_feats_{fid} "
+                        f"not found; skipping.")
+                    continue
+                u_offset, u_length = user_int_fid_to_entry[fid]
+                # Dense and int dims may differ in pathological schemas; we
+                # pad/truncate to the int length so the buffer write is safe.
+                if dim != u_length:
+                    logging.warning(
+                        f"paired fid {fid}: dense_dim={dim} != "
+                        f"user_int_length={u_length}; will pad/truncate to int length.")
+                self._user_pair_plan.append((ci_dense, dim, u_offset, u_length))
+
+        # Pre-allocate the float weight buffer aligned to user_int_feats.
+        # Filled with 1.0 by default so non-paired fids degenerate to the
+        # original mean-pooling behaviour on the model side.
+        self._buf_user_int_weights = np.ones(
+            (B, self.user_int_schema.total_dim), dtype=np.float32
+        )
 
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
         self._seq_plan = {}
@@ -330,10 +398,52 @@ class PCVRParquetDataset(IterableDataset):
             self.item_int_vocab_sizes.extend([vs] * dim)
 
         # ---- user_dense: [[fid, dim], ...] ----
+        # When split_user_dense=True the user_dense_feats column family is
+        # logically partitioned into two streams:
+        #   - UE stream: every fid NOT listed in ``_user_pair_fids``. Stays
+        #     inside ``user_dense_schema`` (and thus ``user_dense_feats``),
+        #     gets the appended request-time features, and is projected by a
+        #     single ``user_dense_proj`` on the model side.
+        #   - Paired stream: fids listed in ``_user_pair_fids``. They are
+        #     removed from ``user_dense_schema`` and routed to a separate
+        #     ``user_int_weights`` tensor at convert time (filled at the same
+        #     offset as the same-fid user_int feature). The model-side
+        #     user-int tokenizer then performs weighted-mean pooling instead
+        #     of plain mean for those fids.
         self._user_dense_cols: List[List[int]] = raw['user_dense']
         self.user_dense_schema: FeatureSchema = FeatureSchema()
+
+        all_dense_fids: set = {fid for fid, _ in self._user_dense_cols}
+        if self._split_user_dense:
+            missing_ue = self._user_ue_fids - all_dense_fids
+            unknown_pair = self._user_pair_fids - all_dense_fids
+            if missing_ue:
+                logging.warning(
+                    f"split_user_dense: requested UE fids {sorted(missing_ue)} "
+                    f"are not present in user_dense schema; they will be ignored.")
+            if unknown_pair:
+                logging.warning(
+                    f"split_user_dense: requested paired fids {sorted(unknown_pair)} "
+                    f"are not present in user_dense schema; they will be ignored.")
+
+        # paired_fids is the effective set (intersection with the actual
+        # user_dense schema) used by all downstream filtering.
+        self._effective_paired_fids: set = (
+            self._user_pair_fids & all_dense_fids if self._split_user_dense else set()
+        )
+
         for fid, dim in self._user_dense_cols:
+            if fid in self._effective_paired_fids:
+                continue
             self.user_dense_schema.add(fid, dim)
+
+        if self._split_user_dense:
+            logging.info(
+                f"split_user_dense=True: user_dense_schema retains "
+                f"{len(self.user_dense_schema.entries)}/{len(self._user_dense_cols)} fids "
+                f"(total_dim={self.user_dense_schema.total_dim}); paired fids = "
+                f"{sorted(self._effective_paired_fids)}"
+            )
 
         # ---- item_dense (empty) ----
         self.item_dense_schema: FeatureSchema = FeatureSchema()
@@ -609,6 +719,18 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- user_int_weights (paired-dense → weight buffer) ----
+        # The buffer is sized to match user_int_feats so that the model-side
+        # tokenizer can index it with the same (offset, length) slice used for
+        # user_int_feats. Non-paired positions stay at the default 1.0 so the
+        # weighted-mean degenerates into the original plain mean.
+        user_int_weights = self._buf_user_int_weights[:B]
+        user_int_weights[:] = 1.0
+        for ci_dense, dense_dim, u_offset, u_length in self._user_pair_plan:
+            col = batch.column(ci_dense)
+            padded = self._pad_varlen_float_column(col, u_length, B)
+            user_int_weights[:, u_offset:u_offset + u_length] = padded
+
         # ---- 时间特征（追加到 user_dense 末尾的 5 个 float 槽）────────────────
         # timestamps 是样本级请求时刻（秒级 Unix 时间戳），已在 meta 段读取。
         # hour：一天中第几小时（0-23）；dow：星期几（0=周一，6=周日）。
@@ -635,6 +757,12 @@ class PCVRParquetDataset(IterableDataset):
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
         }
+
+        # Emit user_int_weights only when the split is active and at least one
+        # paired fid resolved successfully; otherwise downstream code falls
+        # back to the original mean-pooling path automatically.
+        if self._split_user_dense and self._user_pair_plan:
+            result['user_int_weights'] = torch.from_numpy(user_int_weights.copy())
 
         # 离散时间特征（hour / day-of-week），供模型构造专用 time NS token。
         # 索引从 1 开始，保留 0 作为 padding/unknown。
@@ -746,6 +874,9 @@ def get_pcvr_data(
     seq_max_lens: Optional[Dict[str, int]] = None,
     use_time_features: bool = True,
     use_time_ns: bool = True,
+    split_user_dense: bool = False,
+    user_ue_fids: Optional[List[int]] = None,
+    user_pair_fids: Optional[List[int]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -813,6 +944,9 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         use_time_features=use_time_features,
         use_time_ns=use_time_ns,
+        split_user_dense=split_user_dense,
+        user_ue_fids=user_ue_fids,
+        user_pair_fids=user_pair_fids,
     )
 
     # ── Step 4：构造训练 DataLoader ───────────────────────────────────────────
@@ -848,6 +982,9 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         use_time_features=use_time_features,
         use_time_ns=use_time_ns,
+        split_user_dense=split_user_dense,
+        user_ue_fids=user_ue_fids,
+        user_pair_fids=user_pair_fids,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

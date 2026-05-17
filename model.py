@@ -17,6 +17,14 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Optional weight tensor aligned to ``user_int_feats``' flat layout.
+    # When the dataset is configured with ``split_user_dense=True``, paired
+    # user_dense fids are routed here so the user-int tokenizer can perform
+    # weighted-mean pooling on those multi-value fids. Non-paired positions
+    # are filled with 1.0, making the weighted-mean degenerate to the
+    # original plain mean for every untouched fid. ``None`` preserves the
+    # legacy unweighted behaviour for every fid.
+    user_int_weights: Optional[torch.Tensor] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -985,6 +993,49 @@ class MultiSeqHyFormerBlock(nn.Module):
 # PCVRHyFormer Main Model
 # ═══════════════════════════════════════════════════════════════════════════════
 
+PAIR_POOLING_CHOICES = ('relu_weighted', 'softmax', 'residual_softmax')
+
+
+def pool_multi_value_feature(
+    emb_all: torch.Tensor,
+    vals: torch.Tensor,
+    int_weights: Optional[torch.Tensor],
+    pair_pooling: str = 'relu_weighted',
+    pair_beta: float = 0.5,
+) -> torch.Tensor:
+    """Pool embeddings for one multi-value int feature into (B, emb_dim).
+
+    When ``int_weights`` is None, always uses masked mean pooling (legacy).
+    Otherwise applies ``pair_pooling`` on top of valid (non-padding) positions.
+    """
+    mask = (vals != 0).float()  # (B, length)
+    count = mask.sum(dim=1, keepdim=True).clamp(min=1)
+    mean_emb = (emb_all * mask.unsqueeze(-1)).sum(dim=1) / count
+
+    if int_weights is None:
+        return mean_emb
+
+    if pair_pooling not in PAIR_POOLING_CHOICES:
+        raise ValueError(
+            f"pair_pooling must be one of {PAIR_POOLING_CHOICES}, got {pair_pooling!r}")
+
+    w_raw = int_weights * mask
+
+    if pair_pooling == 'relu_weighted':
+        w = F.relu(w_raw)
+        w_sum = w.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        return (emb_all * w.unsqueeze(-1)).sum(dim=1) / w_sum
+
+    w = F.relu(w_raw).masked_fill(mask == 0, -1e9)
+    w = F.softmax(w, dim=1)
+    weighted_emb = (emb_all * w.unsqueeze(-1)).sum(dim=1)
+
+    if pair_pooling == 'softmax':
+        return weighted_emb
+
+    beta = float(pair_beta)
+    return beta * mean_emb + (1.0 - beta) * weighted_emb
+
 
 class GroupNSTokenizer(nn.Module):
     """NS tokenizer used by ns_tokenizer_type='group'.
@@ -994,14 +1045,23 @@ class GroupNSTokenizer(nn.Module):
     NS token (one token per group).
     """
 
-    def __init__(self, feature_specs: List[Tuple[int, int, int]],
-                 groups: List[List[int]], emb_dim: int, d_model: int,
-                 emb_skip_threshold: int = 0) -> None:
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        groups: List[List[int]],
+        emb_dim: int,
+        d_model: int,
+        emb_skip_threshold: int = 0,
+        pair_pooling: str = 'relu_weighted',
+        pair_beta: float = 0.5,
+    ) -> None:
         super().__init__()
         self.feature_specs = feature_specs
         self.groups = groups
         self.emb_dim = emb_dim
         self.emb_skip_threshold = emb_skip_threshold
+        self.pair_pooling = pair_pooling
+        self.pair_beta = pair_beta
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1032,11 +1092,21 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        int_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
             int_feats: (B, total_int_dim), concatenated integer features.
+            int_weights: optional (B, total_int_dim) float tensor aligned to
+                ``int_feats``. When provided, multi-value fids switch from
+                plain mean pooling to weighted-mean pooling using this slice
+                as positional weights (paired with the same fid's user_dense
+                values). Non-paired positions are expected to carry weight
+                1.0 so the result equals the original mean.
 
         Returns:
             Tokens of shape (B, num_groups, D).
@@ -1056,12 +1126,19 @@ class GroupNSTokenizer(nn.Module):
                         # Single-value feature: direct lookup
                         fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
                     else:
-                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
+                        # Multi-value feature: lookup then (weighted) mean pooling.
+                        # padding ids (==0) are zeroed via ``mask`` and never
+                        # contribute regardless of any external weight values.
                         vals = int_feats[:, offset:offset + length].long()  # (B, length)
                         emb_all = emb_layer(vals)  # (B, length, emb_dim)
-                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
-                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                        w_slice = (
+                            int_weights[:, offset:offset + length]
+                            if int_weights is not None else None
+                        )
+                        fid_emb = pool_multi_value_feature(
+                            emb_all, vals, w_slice,
+                            self.pair_pooling, self.pair_beta,
+                        )
                 fid_embs.append(fid_emb)
             cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
@@ -1084,6 +1161,8 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        pair_pooling: str = 'relu_weighted',
+        pair_beta: float = 0.5,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1094,6 +1173,8 @@ class RankMixerNSTokenizer(nn.Module):
             d_model: Output token dimension.
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
+            pair_pooling: Pooling mode for multi-value fids when int_weights given.
+            pair_beta: Mean-branch weight for ``residual_softmax``.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1101,6 +1182,8 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.pair_pooling = pair_pooling
+        self.pair_beta = pair_beta
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1146,11 +1229,19 @@ class RankMixerNSTokenizer(nn.Module):
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        int_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
+            int_weights: optional (B, total_int_dim) float tensor aligned to
+                ``int_feats``. When provided, multi-value fids switch from
+                plain mean pooling to weighted-mean pooling. See
+                :class:`GroupNSTokenizer.forward` for the full semantics.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1170,9 +1261,14 @@ class RankMixerNSTokenizer(nn.Module):
                     else:
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
-                        mask = (vals != 0).float().unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        w_slice = (
+                            int_weights[:, offset:offset + length]
+                            if int_weights is not None else None
+                        )
+                        fid_emb = pool_multi_value_feature(
+                            emb_all, vals, w_slice,
+                            self.pair_pooling, self.pair_beta,
+                        )
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -1258,6 +1354,8 @@ class PCVRHyFormer(nn.Module):
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
         use_time_ns: bool = True,
+        pair_pooling: str = 'relu_weighted',
+        pair_beta: float = 0.5,
     ) -> None:
         super().__init__()
 
@@ -1274,6 +1372,8 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_time_ns = use_time_ns
+        self.pair_pooling = pair_pooling
+        self.pair_beta = pair_beta
 
         # ================== NS Tokens Construction ==================
 
@@ -1285,6 +1385,8 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                pair_pooling=pair_pooling,
+                pair_beta=pair_beta,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1310,6 +1412,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                pair_pooling=pair_pooling,
+                pair_beta=pair_beta,
             )
             num_user_ns = user_ns_tokens
 
@@ -1668,8 +1772,11 @@ class PCVRHyFormer(nn.Module):
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
+        # 1. NS tokens: grouped projection. user_int_weights, when supplied,
+        # switches multi-value user fids to weighted-mean pooling (paired-dense
+        # branch of split_user_dense). item side has no such pairing.
+        user_int_weights = inputs.user_int_weights
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats, user_int_weights)  # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
         ns_parts = [user_ns]
@@ -1718,7 +1825,8 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        user_int_weights = inputs.user_int_weights
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats, user_int_weights)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]

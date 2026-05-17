@@ -22,6 +22,10 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #                          vocab_size > 100万 的超高基数特征跳过 Embedding 分配，
 #                          前向时以零向量代替，节省 GPU 显存
 #   --num_workers 8        DataLoader 并行读取 Parquet 数据的进程数
+#   --use_amp --use_compile  bf16 混合精度 + torch.compile（默认已开启，可用
+#                          --no-use_amp / --no-use_compile 关闭）
+#   split_user_dense       UE(61,87)+时间走 user_dense_proj；62-66 的 dense 作
+#                          user_int_weights（ReLU 加权 mean）；89-91 留在 dense
 #   "$@"                   将调用 run.sh 时附加的所有额外参数透传给 train.py，
 #                          例如：bash run.sh --batch_size 512 --lr 3e-4
 python3 -u "${SCRIPT_DIR}/train.py" \
@@ -32,6 +36,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
+    --split_user_dense \
+    --user_ue_fids '61,87' \
+    --user_pair_fids '62,63,64,65,66' \
+    --use_amp \
+    --use_compile \
     "$@"
 
 # ---- 备选配置：GroupNSTokenizer，由 ns_groups.json 驱动 ----

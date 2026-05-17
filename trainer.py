@@ -58,6 +58,7 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        use_amp: bool = False,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -74,9 +75,10 @@ class PCVRHyFormerRankingTrainer:
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
-        if hasattr(model, 'get_sparse_params'):
-            sparse_params = model.get_sparse_params()
-            dense_params = model.get_dense_params()
+        base_model = self._unwrap_model(model)
+        if hasattr(base_model, 'get_sparse_params'):
+            sparse_params = base_model.get_sparse_params()
+            dense_params = base_model.get_dense_params()
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
@@ -107,10 +109,20 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        amp_enabled = use_amp and device.startswith('cuda')
+        self._autocast = torch.amp.autocast(
+            device_type='cuda', dtype=torch.bfloat16, enabled=amp_enabled)
+        if amp_enabled:
+            logging.info('bf16 AMP enabled (autocast)')
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+
+    @staticmethod
+    def _unwrap_model(model: nn.Module) -> nn.Module:
+        """Return the underlying module when ``model`` is torch.compile-wrapped."""
+        return getattr(model, '_orig_mod', model)
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -361,8 +373,10 @@ class PCVRHyFormerRankingTrainer:
                         if p.data_ptr() in self.sparse_optimizer.state:
                             old_state[p.data_ptr()] = self.sparse_optimizer.state[p]
 
-                reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
-                sparse_params = self.model.get_sparse_params()
+                base_model = self._unwrap_model(self.model)
+                reinit_ptrs = base_model.reinit_high_cardinality_params(
+                    self.reinit_cardinality_threshold)
+                sparse_params = base_model.get_sparse_params()
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
                 )
@@ -398,6 +412,10 @@ class PCVRHyFormerRankingTrainer:
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            # Optional float tensor aligned to user_int_feats. Present only
+            # when split_user_dense is enabled and at least one paired fid
+            # resolved; absent batches fall back to plain mean pooling.
+            user_int_weights=device_batch.get('user_int_weights'),
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
@@ -410,13 +428,15 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        with self._autocast:
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-        else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(
+                    logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
@@ -453,8 +473,9 @@ class PCVRHyFormerRankingTrainer:
         all_logits = torch.cat(all_logits_list, dim=0)
         all_labels = torch.cat(all_labels_list, dim=0).long()
 
-        # Binary AUC via sklearn.
-        probs = torch.sigmoid(all_logits).numpy()
+        # AMP (bf16) logits are not convertible to numpy; cast to float32 first.
+        all_logits_f = all_logits.float()
+        probs = torch.sigmoid(all_logits_f).numpy()
         labels_np = all_labels.numpy()
 
         # Filter NaN predictions (may appear if gradients explode).
@@ -472,10 +493,12 @@ class PCVRHyFormerRankingTrainer:
             auc = float(roc_auc_score(labels_np, probs))
 
         # Binary logloss (same NaN filtering).
-        valid_logits = all_logits[~torch.isnan(all_logits)]
-        valid_labels = all_labels[~torch.isnan(all_logits)]
+        valid_logits = all_logits_f[~torch.isnan(all_logits_f)]
+        valid_labels = all_labels[~torch.isnan(all_logits_f)]
         if len(valid_logits) > 0:
-            logloss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels.float()).item()
+            logloss = F.binary_cross_entropy_with_logits(
+                valid_logits, valid_labels.float()
+            ).item()
         else:
             logloss = float('inf')
 
@@ -489,7 +512,8 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+        with self._autocast:
+            logits = self.model(model_input)  # (B, 1)
         logits = logits.squeeze(-1)  # (B,)
 
         return logits, label

@@ -69,6 +69,8 @@ _FALLBACK_MODEL_CFG = {
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
     'use_time_ns': True,
+    'pair_pooling': 'relu_weighted',
+    'pair_beta': 0.5,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -302,6 +304,10 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        # Forwarded only when the training-time config enabled
+        # ``split_user_dense``; absent batches keep the legacy mean-pooling
+        # path inside the tokenizer.
+        user_int_weights=device_batch.get('user_int_weights'),
     )
 
 
@@ -341,6 +347,17 @@ def main() -> None:
     logging.info(f"use_time_features: {use_time_features}")
     logging.info(f"use_time_ns: {use_time_ns}")
 
+    # user_dense split：训练时若启用了 split_user_dense，则推理也必须启用同一组
+    # fid 配置，否则 ``user_dense_dim`` 会与训练时不一致并导致 state_dict 加载
+    # shape mismatch。默认 False 保持向后兼容（旧 checkpoint 走 legacy 路径）。
+    split_user_dense = bool(train_config.get('split_user_dense', False))
+    user_ue_fids = train_config.get('user_ue_fids') or None
+    user_pair_fids = train_config.get('user_pair_fids') or None
+    logging.info(
+        f"split_user_dense: {split_user_dense}, "
+        f"user_ue_fids: {user_ue_fids}, user_pair_fids: {user_pair_fids}"
+    )
+
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -351,6 +368,9 @@ def main() -> None:
         is_training=False,
         use_time_features=use_time_features,
         use_time_ns=use_time_ns,
+        split_user_dense=split_user_dense,
+        user_ue_fids=user_ue_fids,
+        user_pair_fids=user_pair_fids,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
@@ -411,7 +431,7 @@ def main() -> None:
 
             logits, _ = model.predict(model_input)
             logits = logits.squeeze(-1)
-            probs = torch.sigmoid(logits).cpu().numpy()
+            probs = torch.sigmoid(logits.float()).cpu().numpy()
             all_probs.extend(probs.tolist())
             all_user_ids.extend(user_ids)
 

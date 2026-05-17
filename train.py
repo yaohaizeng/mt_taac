@@ -88,6 +88,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
+    parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=True,
+                        help='bf16 autocast on CUDA (default: on; use --no-use_amp to disable)')
+    parser.add_argument('--use_compile', action=argparse.BooleanOptionalAction, default=True,
+                        help='torch.compile the model forward (default: on; use --no-use_compile to disable)')
+    parser.add_argument('--compile_mode', type=str, default='default',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode (only when --use_compile)')
 
     # ── 3. 数据管道 ───────────────────────────────────────────────────────────
     parser.add_argument('--num_workers', type=int, default=16,
@@ -266,7 +273,49 @@ def parse_args() -> argparse.Namespace:
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
 
+    # ── user_dense 拆分（实验性）─────────────────────────────────────────────
+    # split_user_dense=True 时把 user_dense_feats 拆成两条数据流：
+    #   ① UE（user embedding）：--user_ue_fids 指定的 fid 留在 user_dense_feats
+    #      末尾，与 5 维时间特征共享同一个 user_dense_proj，产出 1 个 NS token；
+    #   ② paired-dense：--user_pair_fids 指定的 fid 从 user_dense_feats 剥离，
+    #      作为 user_int_weights（与 user_int_feats 同形）输出，模型侧
+    #      user-int tokenizer 对这些多值 fid 改用 weighted-mean pooling
+    #      （权重 = 对应 dense 值；权重小于 0 时通过 ReLU 截断）。
+    # 默认 False 保持向后兼容；推理时需自动从 train_config.json 读取同名配置。
+    parser.add_argument('--split_user_dense', action='store_true', default=False,
+                        help='Split user_dense_feats into UE branch (kept in '
+                             'user_dense_feats) and paired branch (emitted as '
+                             'user_int_weights, used for weighted-mean pooling '
+                             'on same-fid user_int multi-value features)')
+    parser.add_argument('--user_ue_fids', type=str, default='61,87',
+                        help='Comma-separated dense fids treated as User '
+                             'Embedding when --split_user_dense is on '
+                             '(unknown fids are silently skipped). '
+                             'Default 61,87 follows ns_groups.json conventions.')
+    parser.add_argument('--user_pair_fids', type=str,
+                        default='62,63,64,65,66',
+                        help='Comma-separated dense fids paired with same-fid '
+                             'user_int features when --split_user_dense is on. '
+                             'Default 62-66 only; 89-91 stay in user_dense_feats.')
+    parser.add_argument('--pair_pooling', type=str, default='relu_weighted',
+                        choices=['relu_weighted', 'softmax', 'residual_softmax'],
+                        help='How to pool multi-value user_int fids when '
+                             'user_int_weights is set (split_user_dense)')
+    parser.add_argument('--pair_beta', type=float, default=0.5,
+                        help='Mean-branch weight for residual_softmax only '
+                             '(ignored when pair_pooling != residual_softmax)')
+
     args = parser.parse_args()
+
+    # ── 解析逗号分隔的 fid 列表 ───────────────────────────────────────────────
+    # 空字符串 → None 等价于"不拆分该 fid 子集"；非法 token 通过 int() 直接抛错。
+    def _parse_fid_list(s: str) -> List[int]:
+        if not s:
+            return []
+        return [int(x.strip()) for x in s.split(',') if x.strip()]
+
+    args.user_ue_fids = _parse_fid_list(args.user_ue_fids)
+    args.user_pair_fids = _parse_fid_list(args.user_pair_fids)
 
     # 环境变量优先级高于 CLI，方便在训练平台/容器中统一注入路径而无需修改启动命令。
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
@@ -330,6 +379,9 @@ def main() -> None:
         seq_max_lens=seq_max_lens,
         use_time_features=args.use_time_features,
         use_time_ns=args.use_time_ns,
+        split_user_dense=args.split_user_dense,
+        user_ue_fids=args.user_ue_fids,
+        user_pair_fids=args.user_pair_fids,
     )
 
     # ── NS 分组解析 ───────────────────────────────────────────────────────────
@@ -451,9 +503,22 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         # 离散时间 NS token 开关（叠加于连续时间特征之上）
         "use_time_ns": args.use_time_ns,
+        # user int–dense pair pooling（仅 user_ns_tokenizer）
+        "pair_pooling": args.pair_pooling,
+        "pair_beta": args.pair_beta,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
+
+    use_cuda = args.device.startswith('cuda')
+    if args.use_amp and not use_cuda:
+        logging.warning('--use_amp requested but device is not CUDA; AMP disabled')
+    if args.use_compile:
+        if use_cuda:
+            logging.info(f'torch.compile enabled (mode={args.compile_mode}, dynamic=True)')
+            model = torch.compile(model, mode=args.compile_mode, dynamic=True)
+        else:
+            logging.warning('--use_compile requested but device is not CUDA; compile disabled')
 
     # 打印 token 数 T 的实际值，方便核验 RankMixerBlock 的 d_model % T == 0 约束。
     num_sequences = len(pcvr_dataset.seq_domains)
@@ -507,6 +572,7 @@ def main() -> None:
         # 推理时无需依赖训练机器上的原始路径。
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
+        use_amp=args.use_amp and use_cuda,
         # 完整超参快照写入 checkpoint 的 train_config.json，便于复现和审计
         train_config=vars(args),
     )
