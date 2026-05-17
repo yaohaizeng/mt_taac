@@ -15,10 +15,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from utils import sigmoid_focal_loss, EarlyStopping
+from utils import sigmoid_focal_loss, EarlyStopping, log_batch_data_stats
 from model import ModelInput
 
 
@@ -59,6 +58,9 @@ class PCVRHyFormerRankingTrainer:
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
         use_amp: bool = False,
+        show_progress: bool = False,
+        log_dir: Optional[str] = None,
+        train_dataset: Optional[Any] = None,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -114,6 +116,11 @@ class PCVRHyFormerRankingTrainer:
             device_type='cuda', dtype=torch.bfloat16, enabled=amp_enabled)
         if amp_enabled:
             logging.info('bf16 AMP enabled (autocast)')
+
+        self.show_progress: bool = show_progress
+        self.log_dir: Optional[str] = log_dir
+        self.train_dataset = train_dataset
+        self._data_stats_logged: bool = False
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -303,24 +310,30 @@ class PCVRHyFormerRankingTrainer:
         epoch-level validation, triggers EarlyStopping and the periodic sparse
         re-initialization strategy.
         """
-        print("Start training (PCVRHyFormer)")
+        logging.info('Start training (PCVRHyFormer)')
         self.model.train()
         total_step = 0
+        n_batches = len(self.train_loader)
 
         for epoch in range(1, self.num_epochs + 1):
-            train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
-                              dynamic_ncols=True)
             loss_sum = 0.0
+            train_loader_iter = self.train_loader
+            if self.show_progress:
+                from tqdm import tqdm
+                train_loader_iter = tqdm(
+                    self.train_loader, total=n_batches, dynamic_ncols=True)
 
-            for step, batch in train_pbar:
+            for step, batch in enumerate(train_loader_iter):
+                if not self._data_stats_logged:
+                    log_batch_data_stats(batch, tag='train_first_batch')
+                    self._data_stats_logged = True
+
                 loss = self._train_step(batch)
                 total_step += 1
                 loss_sum += loss
 
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
-
-                train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
@@ -341,7 +354,10 @@ class PCVRHyFormerRankingTrainer:
                         logging.info(f"Early stopping at step {total_step}")
                         return
 
-            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
+            avg_loss = loss_sum / max(n_batches, 1)
+            logging.info(
+                f'Epoch {epoch}/{self.num_epochs} | steps={n_batches} | '
+                f'avg_train_loss={avg_loss:.6f} | global_step={total_step}')
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()
@@ -358,6 +374,12 @@ class PCVRHyFormerRankingTrainer:
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")
                 break
+
+            if epoch == 1 and self.train_dataset is not None:
+                oob_path = None
+                if self.log_dir:
+                    oob_path = os.path.join(self.log_dir, 'oob_stats.txt')
+                self.train_dataset.dump_oob_stats(path=oob_path)
 
             # After the configured epoch, reinitialize high-cardinality sparse
             # params (Embeddings) as a form of cold restart to reduce overfit.
@@ -454,18 +476,24 @@ class PCVRHyFormerRankingTrainer:
         NaN predictions (which can arise from exploding gradients) are filtered
         out before computing both metrics.
         """
-        print("Start Evaluation (PCVRHyFormer) - validation")
+        logging.info('Start validation')
         self.model.eval()
         if not epoch:
             epoch = -1
 
-        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
+        valid_loader_iter = self.valid_loader
+        if self.show_progress:
+            from tqdm import tqdm
+            valid_loader_iter = tqdm(
+                self.valid_loader, total=len(self.valid_loader))
 
         all_logits_list = []
         all_labels_list = []
 
         with torch.no_grad():
-            for step, batch in pbar:
+            for step, batch in enumerate(valid_loader_iter):
+                if step == 0:
+                    log_batch_data_stats(batch, tag='valid_first_batch')
                 logits, labels = self._evaluate_step(batch)
                 all_logits_list.append(logits.detach().cpu())
                 all_labels_list.append(labels.detach().cpu())

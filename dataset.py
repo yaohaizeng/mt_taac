@@ -197,9 +197,10 @@ class PCVRParquetDataset(IterableDataset):
                 ``time_feats[:, 0]=hour(1..24)``, ``time_feats[:, 1]=dow(1..7)``
                 for a dedicated time NS token on the model side.
             split_user_dense: if True, split user_dense_feats into two streams:
-                ① UE branch (``user_ue_fids`` + appended time features) remains
-                   in ``user_dense_feats`` and is projected via ``user_dense_proj``;
-                ② paired branch (``user_pair_fids``) is removed from
+                ① UE branch (``user_ue_fids``) remains in ``user_dense_feats``;
+                   continuous dense time (5-dim) is **not** appended in this mode;
+                   discrete time may still use ``use_time_ns``.
+                ② paired branch (``user_pair_fids`` only) is removed from
                    ``user_dense_feats`` and emitted as ``user_int_weights``
                    aligned to ``user_int_feats``' layout, so the user-int
                    tokenizer can do weighted-mean pooling instead of plain mean.
@@ -231,13 +232,20 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
-        self._use_time_ns = use_time_ns
         # user_dense split configuration; _user_pair_fids drives the weighting
         # logic in _convert_batch and is also exposed for downstream consumers
         # to know which fids carry semantic pair weights.
         self._split_user_dense = split_user_dense
         self._user_ue_fids = set(user_ue_fids or [])
         self._user_pair_fids = set(user_pair_fids or [])
+        # Pair 权重仅来自 user_pair_fids 的业务 dense，不用连续 dense 时间做 pair。
+        if self._split_user_dense and use_time_features:
+            use_time_features = False
+            logging.info(
+                "split_user_dense: use_time_features=False on user_dense_feats "
+                "(pair weights from user_pair_fids only); use_time_ns unchanged"
+            )
+        self._use_time_ns = use_time_ns
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -401,9 +409,8 @@ class PCVRParquetDataset(IterableDataset):
         # When split_user_dense=True the user_dense_feats column family is
         # logically partitioned into two streams:
         #   - UE stream: every fid NOT listed in ``_user_pair_fids``. Stays
-        #     inside ``user_dense_schema`` (and thus ``user_dense_feats``),
-        #     gets the appended request-time features, and is projected by a
-        #     single ``user_dense_proj`` on the model side.
+        #     inside ``user_dense_schema`` and is projected by ``user_dense_proj``.
+        #     Continuous dense request-time is not appended (see __init__).
         #   - Paired stream: fids listed in ``_user_pair_fids``. They are
         #     removed from ``user_dense_schema`` and routed to a separate
         #     ``user_int_weights`` tensor at convert time (filled at the same
@@ -574,20 +581,20 @@ class PCVRParquetDataset(IterableDataset):
         otherwise to ``logging.info``.
         """
         if not self._oob_stats:
-            logging.info("No out-of-bound values detected.")
+            logging.info('[DATA] No out-of-bound feature IDs detected.')
             return
-        lines = ["=== Out-of-Bound Stats ==="]
+        lines = ['[DATA] === out-of-bound ID stats ===']
         for (group, ci), s in sorted(self._oob_stats.items()):
             direction = "TOO_HIGH" if s['min_oob'] >= s['vocab'] else "TOO_LOW"
             lines.append(
-                f"  {group} col_idx={ci}: vocab={s['vocab']}, "
+                f"[DATA]   {group} col_idx={ci}: vocab={s['vocab']}, "
                 f"oob_count={s['count']}, range=[{s['min_oob']}, {s['max']}], "
                 f"{direction}")
         msg = "\n".join(lines)
         if path:
-            with open(path, 'w') as f:
+            with open(path, 'w', encoding='utf-8') as f:
                 f.write(msg + "\n")
-            logging.info(f"OOB stats written to {path}")
+            logging.info(f'[DATA] OOB stats written to {path}')
         else:
             logging.info(msg)
 
@@ -892,6 +899,13 @@ def get_pcvr_data(
         返回 train_dataset 是因为调用方（train.py）需要从中读取
         ``user_int_schema``、``item_int_schema`` 等特征元信息来构造模型。
     """
+    if split_user_dense and use_time_features:
+        logging.info(
+            "split_user_dense: disabling dense request-time on user_dense_feats "
+            "(pair uses user_pair_fids dense only)"
+        )
+        use_time_features = False
+
     random.seed(seed)
 
     # ── Step 1：枚举所有 Row Group ────────────────────────────────────────────

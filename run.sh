@@ -24,8 +24,8 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #   --num_workers 8        DataLoader 并行读取 Parquet 数据的进程数
 #   --use_amp --use_compile  bf16 混合精度 + torch.compile（默认已开启，可用
 #                          --no-use_amp / --no-use_compile 关闭）
-#   split_user_dense       UE(61,87)+时间走 user_dense_proj；62-66 的 dense 作
-#                          user_int_weights（ReLU 加权 mean）；89-91 留在 dense
+#   split_user_dense       UE(61,87) 等走 user_dense_proj；62-66 dense 作 pair 权重；
+#                          连续 dense 时间不进 user_dense；离散时间仍用 use_time_ns
 #   "$@"                   将调用 run.sh 时附加的所有额外参数透传给 train.py，
 #                          例如：bash run.sh --batch_size 512 --lr 3e-4
 python3 -u "${SCRIPT_DIR}/train.py" \

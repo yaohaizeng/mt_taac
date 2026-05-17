@@ -1,10 +1,11 @@
+import json
 import os
 import random
 import copy
 import logging
 import time
 from datetime import timedelta
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -231,6 +232,121 @@ class EarlyStopping:
         os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
         torch.save(model.state_dict(), self.checkpoint_path)
         self.best_saved_score = score
+
+
+_DATA_TAG = '[DATA]'
+
+
+def log_schema_for_eda(
+    schema_path: str,
+    log_dir: Optional[str] = None,
+    log_full_json: bool = False,
+) -> None:
+    """Log schema summary (and optionally full JSON) for platform-side EDA.
+
+    Always writes ``schema_dump.json`` under ``log_dir`` when provided.
+    """
+    with open(schema_path, 'r', encoding='utf-8') as f:
+        raw: Dict[str, Any] = json.load(f)
+
+    lines: List[str] = [
+        f'{_DATA_TAG} === schema summary ===',
+        f'{_DATA_TAG} schema_path: {schema_path}',
+    ]
+    for key in ('user_int', 'item_int'):
+        cols = raw.get(key, [])
+        if not cols:
+            continue
+        fids = [c[0] for c in cols]
+        max_vocab = max(c[1] for c in cols)
+        total_dim = sum(c[2] for c in cols)
+        lines.append(
+            f'{_DATA_TAG}   {key}: n_features={len(cols)}, flat_dim={total_dim}, '
+            f'max_vocab={max_vocab}, fids={fids}')
+    user_dense = raw.get('user_dense', [])
+    if user_dense:
+        lines.append(
+            f'{_DATA_TAG}   user_dense: n_features={len(user_dense)}, '
+            f'fids={[c[0] for c in user_dense]}')
+    seq_cfg = raw.get('seq', {})
+    for domain in sorted(seq_cfg.keys()):
+        cfg = seq_cfg[domain]
+        feats = cfg.get('features', [])
+        lines.append(
+            f'{_DATA_TAG}   seq.{domain}: prefix={cfg.get("prefix")}, '
+            f'ts_fid={cfg.get("ts_fid")}, n_side_feats={len(feats)}, '
+            f'fids_vocab={[(f, v) for f, v in feats]}')
+    logging.info('\n'.join(lines))
+
+    payload = json.dumps(raw, ensure_ascii=False, indent=2)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        dump_path = os.path.join(log_dir, 'schema_dump.json')
+        with open(dump_path, 'w', encoding='utf-8') as f:
+            f.write(payload)
+        logging.info(f'{_DATA_TAG} Full schema copied to {dump_path}')
+
+    if log_full_json:
+        logging.info(f'{_DATA_TAG} schema.json begin >>>')
+        for line in payload.splitlines():
+            logging.info(f'{_DATA_TAG} {line}')
+        logging.info(f'{_DATA_TAG} schema.json end <<<')
+
+
+def log_batch_data_stats(batch: Dict[str, Any], tag: str = 'train') -> None:
+    """Log one-batch data statistics (label rate, seq lengths, padding, time)."""
+    lines: List[str] = [f'{_DATA_TAG} === batch stats ({tag}) ===']
+
+    label = batch.get('label')
+    if isinstance(label, torch.Tensor):
+        y = label.detach().float().cpu()
+        lines.append(
+            f'{_DATA_TAG}   label: pos_rate={y.mean().item():.6f}, '
+            f'n_pos={int(y.sum().item())}, batch_size={y.numel()}')
+
+    ts = batch.get('timestamp')
+    if isinstance(ts, torch.Tensor):
+        ts_np = ts.detach().cpu().numpy()
+        lines.append(
+            f'{_DATA_TAG}   timestamp: min={int(ts_np.min())}, max={int(ts_np.max())}')
+
+    for key in ('user_int_feats', 'item_int_feats'):
+        t = batch.get(key)
+        if isinstance(t, torch.Tensor):
+            x = t.detach().cpu()
+            zero_frac = (x == 0).float().mean().item()
+            lines.append(
+                f'{_DATA_TAG}   {key}: shape={list(x.shape)}, '
+                f'zero_frac={zero_frac:.4f}, max_id={int(x.max().item())}')
+
+    ud = batch.get('user_dense_feats')
+    if isinstance(ud, torch.Tensor) and ud.numel() > 0:
+        u = ud.detach().float().cpu()
+        lines.append(
+            f'{_DATA_TAG}   user_dense_feats: shape={list(u.shape)}, '
+            f'mean={u.mean().item():.4f}, std={u.std().item():.4f}')
+
+    seq_domains = batch.get('_seq_domains', [])
+    for domain in seq_domains:
+        lens_key = f'{domain}_len'
+        lens = batch.get(lens_key)
+        if isinstance(lens, torch.Tensor):
+            l = lens.detach().cpu().float()
+            lines.append(
+                f'{_DATA_TAG}   {domain}_len: mean={l.mean().item():.2f}, '
+                f'max={int(l.max().item())}, min={int(l.min().item())}')
+        max_len = None
+        seq_t = batch.get(domain)
+        if isinstance(seq_t, torch.Tensor):
+            max_len = seq_t.shape[2]
+        if max_len is not None and isinstance(lens, torch.Tensor):
+            truncated = (lens > max_len).sum().item()
+            if truncated:
+                lines.append(
+                    f'{_DATA_TAG}   {domain}: truncated_rows={truncated} '
+                    f'(len > max_len={max_len})')
+
+    logging.info('\n'.join(lines))
 
 
 def set_seed(seed: int) -> None:

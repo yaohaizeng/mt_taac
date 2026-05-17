@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 import torch
 
-from utils import set_seed, EarlyStopping, create_logger
+from utils import set_seed, EarlyStopping, create_logger, log_schema_for_eda
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--compile_mode', type=str, default='default',
                         choices=['default', 'reduce-overhead', 'max-autotune'],
                         help='torch.compile mode (only when --use_compile)')
+    parser.add_argument('--show_progress', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='tqdm progress bars (default: off; keeps platform logs clean)')
+    parser.add_argument('--log_schema_full', action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help='Also print full schema.json line-by-line in logs')
 
     # ── 3. 数据管道 ───────────────────────────────────────────────────────────
     parser.add_argument('--num_workers', type=int, default=16,
@@ -275,9 +281,9 @@ def parse_args() -> argparse.Namespace:
 
     # ── user_dense 拆分（实验性）─────────────────────────────────────────────
     # split_user_dense=True 时把 user_dense_feats 拆成两条数据流：
-    #   ① UE（user embedding）：--user_ue_fids 指定的 fid 留在 user_dense_feats
-    #      末尾，与 5 维时间特征共享同一个 user_dense_proj，产出 1 个 NS token；
-    #   ② paired-dense：--user_pair_fids 指定的 fid 从 user_dense_feats 剥离，
+    #   ① UE（user embedding）：--user_ue_fids 留在 user_dense_feats，经 user_dense_proj；
+    #      不追加 5 维连续 dense 时间（避免与 pair 实验混用）；离散时间仍可用 use_time_ns；
+    #   ② paired-dense：--user_pair_fids 的 dense 仅作 user_int_weights，不参与时间 pair；
     #      作为 user_int_weights（与 user_int_feats 同形）输出，模型侧
     #      user-int tokenizer 对这些多值 fid 改用 weighted-mean pooling
     #      （权重 = 对应 dense 值；权重小于 0 时通过 ReLU 截断）。
@@ -317,6 +323,10 @@ def parse_args() -> argparse.Namespace:
     args.user_ue_fids = _parse_fid_list(args.user_ue_fids)
     args.user_pair_fids = _parse_fid_list(args.user_pair_fids)
 
+    # int-pair：连续 dense 时间不进 user_dense / 不作 pair 权重；离散 time NS 仍由 use_time_ns 控制。
+    if args.split_user_dense and args.use_time_features:
+        args.use_time_features = False
+
     # 环境变量优先级高于 CLI，方便在训练平台/容器中统一注入路径而无需修改启动命令。
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
     args.ckpt_dir = os.environ.get('TRAIN_CKPT_PATH', args.ckpt_dir)
@@ -337,6 +347,12 @@ def main() -> None:
     # 固定所有随机源（Python / NumPy / PyTorch CPU & CUDA），保证实验可复现。
     set_seed(args.seed)
     create_logger(os.path.join(args.log_dir, 'train.log'))
+    if args.split_user_dense:
+        logging.info(
+            "split_user_dense: use_time_features=False (dense time not on user_dense / "
+            "not used for pair weights); use_time_ns=%s",
+            args.use_time_ns,
+        )
     logging.info(f"Args: {vars(args)}")
 
     # TensorBoard writer：训练 loss 和验证 AUC/LogLoss 均写入同一目录，
@@ -354,6 +370,8 @@ def main() -> None:
 
     if not os.path.exists(schema_path):
         raise FileNotFoundError(f"schema file not found at {schema_path}")
+
+    log_schema_for_eda(schema_path, log_dir=args.log_dir, log_full_json=args.log_schema_full)
 
     # 将 "seq_a:256,seq_b:256,seq_c:512,seq_d:512" 解析为 dict，
     # 传入 dataset 以对各行为域序列独立截断，减少长尾序列的 padding 浪费。
@@ -573,6 +591,9 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         use_amp=args.use_amp and use_cuda,
+        show_progress=args.show_progress,
+        log_dir=args.log_dir,
+        train_dataset=pcvr_dataset,
         # 完整超参快照写入 checkpoint 的 train_config.json，便于复现和审计
         train_config=vars(args),
     )
