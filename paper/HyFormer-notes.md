@@ -148,6 +148,64 @@ $$
 | LONGER-style（推荐） | $H_l = \text{CrossAttn}(S_{\text{short}}, S, S)$ | $O(L_H L_S)$ | 工业在线服务 |
 | Decoder-style | $H_l = \text{SwiGLU}_l(S)$ | $O(L_S)$ | 极低时延场景 |
 
+**与本仓库的对应关系**（`--seq_encoder_type`）：`transformer` 对应 Full Transformer；`longer` 对应 LONGER-style；`swiglu` 对应 Decoder-style（论文称 SwiGLU / attention-free encoder）。三种策略均作为 **MultiSeqHyFormerBlock 第 1 步 Sequence Evolution**：在每层 HyFormer 内先更新序列 KV，再供第 2 步 Query Decoding 的 Cross-Attention 读取；**不是**替代整个 HyFormer，只替换「序列侧如何演化」这一子模块。
+
+##### 序列编码策略详解
+
+三种策略的本质差异：**是否在序列长度 $L_S$ 维度上做全局两两交互（Self-Attention）**，以及 **是否先把长序列压缩成短序列再参与后续计算**。
+
+```text
+每层 MultiSeqHyFormerBlock（每条序列独立）：
+  seq_tokens (B, L, D)
+       ↓  [1] Seq Encoder ← 三种策略在此分支
+  seq_kv   (B, L', D)      L' = L（transformer/swiglu）或 top_k（longer 首层）
+       ↓  [2] CrossAttn(Q, seq_kv)  ← Query Decoding，与编码策略无关
+  decoded_q (B, Nq, D)
+       ↓  [3] RankMixer([所有 decoded_q ‖ ns_tokens])
+```
+
+**策略 1：Full Transformer（`transformer`）**
+
+- **做法**：对整条行为序列做标准 Pre-LN Transformer Encoder 层——多头自注意力（可选 RoPE）+ FFN，输出长度与输入相同（$L' = L_S$）。
+- **数学**：$H^{(l)} = \text{TransformerEnc}_l(S^{(l-1)})$，序列内任意位置可互相关注，捕获长程依赖与顺序模式。
+- **复杂度**：单层 $O(L_S^2 \cdot D)$（注意力）+ $O(L_S \cdot D^2)$（FFN）；堆叠 $L$ 层 HyFormer 时，每层都会重新编码整条序列，KV 随层深度演化（论文强调不共享跨层 KV）。
+- **优点**：表达能力最强，对复杂共现、远距离行为模式建模最充分；与论文 Table 1 中「Full Transformer 作序列侧」的高精度设定一致。
+- **缺点**：序列越长（如 3k）计算与显存压力最大；在线服务需对全长序列做注意力，时延与 KV 体积均偏高。
+- **适用**：离线训练追求 AUC 上限、序列截断较短（如 demo 中 `seq_c/d` 512）、或算力充足时的默认高精度选项（本仓库 `train.py` 默认 `--seq_encoder_type transformer`）。
+
+**策略 2：LONGER-style（`longer`，论文推荐工业默认）**
+
+- **做法**：借鉴 LONGER 的「短 Query 读长序列」思想——**不**对全长做 $L^2$ 自注意力，而是用最近 $K$ 个行为 token 作为 Query，对全长 $S$ 做 Cross-Attention，将序列压缩为长度 $K$ 的表示，再供 HyFormer 的 Query Decoding 使用。
+- **数学（论文）**：$H_l = \text{CrossAttn}(S_{\text{short}}, S, S)$，其中 $|S_{\text{short}}| = L_H \ll L_S$（如 Top-50），复杂度 $O(L_H \cdot L_S)$。
+- **本仓库实现（`LongerEncoder`）**：
+  - 当 $L > K$（$K$ 即 `top_k`，通常为首层 MultiSeqHyFormerBlock）：取每条样本**时间上最近**的 $K$ 个有效 token 为 $Q$，全长序列为 $K/V$，Cross-Attention 输出 $(B, K, D)$；padding mask 同步缩短为 $(B, K)$。
+  - 当 $L \le K$（后续 HyFormer 层）：在已压缩的 $K$ 长度上做 Self-Attention（可选 `--seq_causal` 因果 mask），继续在短序列上演化。
+  - 超参：`--seq_top_k`（默认 50）、`--seq_causal`（仅 `longer` 生效）。
+- **优点**：在保持「Query 主动从长历史里选片段」能力的同时，将序列侧复杂度从 $O(L_S^2)$ 降为 $O(L_H \cdot L_S)$；与在线 KV-Cache、M-Falcon 类预计算更友好（论文 §6 强调工业部署）。
+- **缺点**：远期行为若不在最近 `top_k` 窗口内，需依赖更早层 Cross-Attn 已写入短序列表示；`top_k` 过小会损失长程信号。
+- **适用**：长序列（数百～数千）、工业在线 CTR/CVR、论文主实验与抖音搜索全量方案所采用的序列编码默认。
+
+**策略 3：Decoder-style / SwiGLU（`swiglu`，论文称 attention-free）**
+
+- **做法**：**完全不用注意力**，仅在序列长度维度上逐位置做 `LayerNorm → SwiGLU FFN → 残差`：$H_l = S^{(l-1)} + \text{SwiGLU}(\text{LN}(S^{(l-1)}))$。每个位置独立变换，无 token 间信息交换（除非前序 Embedding 层已混合 side-info）。
+- **复杂度**：单层 $O(L_S \cdot D^2)$，对 $L_S$ 线性，三种策略中最低。
+- **优点**：时延与显存最省；实现简单、易与 GPU Pooling 等工程优化叠加；适合极长序列或严格延迟预算。
+- **缺点**：单层内无法建模「位置 $i$ 与位置 $j$ 的依赖」；长程兴趣主要靠后续 **Query Decoding 的 Cross-Attention**（Global Query 读序列 KV）补救，序列侧自身表达力最弱。
+- **适用**：极低时延、序列极长且更依赖 NS 特征与 Query Boosting 的场景；论文将其作为精度–效率 Pareto 曲线的下界参考，而非 AUC 最优选。
+
+**三种策略对比小结**
+
+| 维度 | Full Transformer | LONGER-style | Decoder-style (SwiGLU) |
+| --- | --- | --- | --- |
+| 序列内交互 | 全局 Self-Attn | 首层 Cross-Attn 压缩 + 短序列 Self-Attn | 无（仅逐点 FFN） |
+| 输出长度 $L'$ | $L_S$ | $\min(L_S, K)$，首层后固定为 $K$（`top_k`） | $L_S$ |
+| 单层复杂度（序列侧） | $O(L_S^2)$ | $O(L_S \cdot L_H)$ | $O(L_S)$ |
+| 长程依赖 | 强 | 中（受 `top_k` 窗口约束） | 弱（依赖 Cross-Attn 补救） |
+| 论文定位 | 精度上界 | **工业推荐默认** | 时延下界 |
+| 本仓库参数 | `--seq_encoder_type transformer` | `--seq_encoder_type longer --seq_top_k 50` | `--seq_encoder_type swiglu` |
+
+**注意**：无论选哪种 Seq Encoder，Query Decoding（Cross-Attn）与 Query Boosting（RankMixer）结构不变；换编码策略只改变「序列 token 在进 Cross-Attn 之前如何被演化/压缩」。论文消融与生产基线（LONGER + RankMixer）表明：在统一 HyFormer 框架下，LONGER-style 在 AUC 与 FLOPs 之间取得最佳平衡（HyFormer 总 FLOPs 3.9T，低于 Full Trans 双塔方案）。
+
 **实现要点**：
 - 长序列 KV 在每层重新计算，而非共享，使序列表示可随 Decoder 深度演化。
 - 多序列场景下，每条序列使用独立的 Query Token 组做 Decoding，不强制合并序列。
