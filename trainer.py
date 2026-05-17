@@ -17,7 +17,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score
 
-from utils import sigmoid_focal_loss, EarlyStopping, log_batch_data_stats
+from utils import (
+    sigmoid_focal_loss,
+    EarlyStopping,
+    log_batch_data_stats,
+    state_dict_for_save,
+)
 from model import ModelInput
 
 
@@ -208,7 +213,10 @@ class PCVRHyFormerRankingTrainer:
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            torch.save(
+                state_dict_for_save(self.model),
+                os.path.join(ckpt_dir, "model.pt"),
+            )
         self._write_sidecar_files(ckpt_dir)
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir

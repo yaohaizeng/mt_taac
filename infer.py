@@ -238,6 +238,25 @@ def build_model(
     return model
 
 
+def _normalize_state_dict_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip ``_orig_mod.`` prefix from checkpoints saved under ``torch.compile``.
+
+    Inference containers often cannot ship ``utils.py``; keep this helper local
+    to ``infer.py``. Training saves unprefixed keys via ``state_dict_for_save``
+    in ``utils.py``, but older checkpoints may still need stripping here.
+    """
+    prefix = '_orig_mod.'
+    if not any(k.startswith(prefix) for k in state_dict):
+        return state_dict
+    logging.info(
+        'Checkpoint has torch.compile _orig_mod. keys; stripping prefix for load'
+    )
+    return {
+        (k[len(prefix):] if k.startswith(prefix) else k): v
+        for k, v in state_dict.items()
+    }
+
+
 def load_model_state_strict(
     model: nn.Module,
     ckpt_path: str,
@@ -246,7 +265,9 @@ def load_model_state_strict(
     """Strictly load ``state_dict``; any missing/unexpected key fails fast
     with a diagnostic message.
     """
-    state_dict = torch.load(ckpt_path, map_location=device)
+    state_dict = _normalize_state_dict_keys(
+        torch.load(ckpt_path, map_location=device)
+    )
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
