@@ -22,6 +22,11 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #                          vocab_size > 100万 的超高基数特征跳过 Embedding 分配，
 #                          前向时以零向量代替，节省 GPU 显存
 #   --num_workers 8        DataLoader 并行读取 Parquet 数据的进程数
+#   加速（可选，需 Ampere+ GPU，同 seed 做 A/B 对比 val AUC）：
+#     baseline:    bash run.sh
+#     amp only:    bash run.sh --use_amp
+#     amp+compile: bash run.sh --use_amp --use_compile
+#   --use_amp / --use_compile  默认关闭
 #   "$@"                   将调用 run.sh 时附加的所有额外参数透传给 train.py，
 #                          例如：bash run.sh --batch_size 512 --lr 3e-4
 python3 -u "${SCRIPT_DIR}/train.py" \

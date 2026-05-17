@@ -412,7 +412,7 @@ def main() -> None:
 
             logits, _ = model.predict(model_input)
             logits = logits.squeeze(-1)
-            probs = torch.sigmoid(logits).cpu().numpy()
+            probs = torch.sigmoid(logits.float()).cpu().numpy()
             all_probs.extend(probs.tolist())
             all_user_ids.extend(user_ids)
 

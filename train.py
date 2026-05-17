@@ -88,6 +88,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
+    parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False,
+                        help='bf16 autocast on CUDA (default: off)')
+    parser.add_argument('--use_compile', action=argparse.BooleanOptionalAction, default=False,
+                        help='torch.compile model forward (default: off)')
+    parser.add_argument('--compile_mode', type=str, default='default',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode (only when --use_compile)')
 
     # ── 3. 数据管道 ───────────────────────────────────────────────────────────
     parser.add_argument('--num_workers', type=int, default=16,
@@ -460,6 +467,17 @@ def main() -> None:
 
     model = PCVRHyFormer(**model_args).to(args.device)
 
+    use_cuda = args.device.startswith('cuda')
+    if args.use_amp and not use_cuda:
+        logging.warning('--use_amp requested but device is not CUDA; AMP disabled')
+    if args.use_compile:
+        if use_cuda:
+            logging.info(
+                f'torch.compile enabled (mode={args.compile_mode}, dynamic=True)')
+            model = torch.compile(model, mode=args.compile_mode, dynamic=True)
+        else:
+            logging.warning('--use_compile requested but device is not CUDA; compile disabled')
+
     # 打印 token 数 T 的实际值，方便核验 RankMixerBlock 的 d_model % T == 0 约束。
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
@@ -513,6 +531,7 @@ def main() -> None:
         # 推理时无需依赖训练机器上的原始路径。
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
+        use_amp=args.use_amp and use_cuda,
         # 完整超参快照写入 checkpoint 的 train_config.json，便于复现和审计
         train_config=vars(args),
     )
