@@ -122,6 +122,10 @@ def parse_args() -> argparse.Namespace:
     # 与序列域数及 NS token 数共同决定 T，需满足 d_model % T == 0。
     parser.add_argument('--num_queries', type=int, default=1,
                         help='Number of Query tokens generated independently per sequence domain')
+    parser.add_argument('--query_pooling', type=str, default='mean',
+                        choices=['mean', 'din'],
+                        help='Query generation pooling over each behavior sequence: '
+                             'mean = masked mean pool, din = target-item cross-attention')
     parser.add_argument('--num_hyformer_blocks', type=int, default=2,
                         help='Number of stacked MultiSeqHyFormerBlock layers')
     parser.add_argument('--num_heads', type=int, default=4,
@@ -451,6 +455,7 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         # 离散时间 NS token 开关（叠加于连续时间特征之上）
         "use_time_ns": args.use_time_ns,
+        "query_pooling": args.query_pooling,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -459,7 +464,8 @@ def main() -> None:
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
+                 f"rank_mixer_mode={args.rank_mixer_mode}, query_pooling={args.query_pooling}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
