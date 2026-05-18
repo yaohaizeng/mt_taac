@@ -22,6 +22,8 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #                          vocab_size > 100万 的超高基数特征跳过 Embedding 分配，
 #                          前向时以零向量代替，节省 GPU 显存
 #   --num_workers 8        DataLoader 并行读取 Parquet 数据的进程数
+#   use_user_pair          fid 62-66 对齐 int/dense → profile + item_aware NS token（+2 num_ns）
+#   rank_mixer_mode        pair+time_ns 时 T=18，64%18≠0；默认 ffn_only（或 --no_time_ns 保 full）
 #   "$@"                   将调用 run.sh 时附加的所有额外参数透传给 train.py，
 #                          例如：bash run.sh --batch_size 512 --lr 3e-4
 python3 -u "${SCRIPT_DIR}/train.py" \
@@ -32,6 +34,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
+    --use_user_pair \
+    --user_pair_fids '62,63,64,65,66' \
+    --user_pair_emb_dim 32 \
+    --rank_mixer_mode ffn_only \
     "$@"
 
 # ---- 备选配置：GroupNSTokenizer，由 ns_groups.json 驱动 ----

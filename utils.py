@@ -96,6 +96,12 @@ def create_logger(filepath: str) -> logging.Logger:
     return logger
 
 
+def state_dict_for_save(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Checkpoint state_dict without torch.compile ``_orig_mod.`` key prefix."""
+    mod = getattr(model, '_orig_mod', model)
+    return mod.state_dict()
+
+
 class EarlyStopping:
     """Early-stop training when the validation metric plateaus.
 
@@ -196,7 +202,7 @@ class EarlyStopping:
             self.best_extra_metrics = extra_metrics
             self.best_saved_score = 0.0
             self.save_checkpoint(score, model)
-            self.best_model = copy.deepcopy(model.state_dict())
+            self.best_model = copy.deepcopy(state_dict_for_save(model))
         elif self._is_not_improved(score):
             self.counter += 1
             logging.info(f'{self.label}earlyStopping counter: {self.counter} / {self.patience}')
@@ -205,7 +211,7 @@ class EarlyStopping:
         else:
             logging.info(f'{self.label}earlyStopping counter reset!')
             self.best_score = score
-            self.best_model = copy.deepcopy(model.state_dict())
+            self.best_model = copy.deepcopy(state_dict_for_save(model))
             self.best_extra_metrics = extra_metrics
             self.save_checkpoint(score, model)
             self.counter = 0
@@ -229,7 +235,7 @@ class EarlyStopping:
         if self.verbose:
             logging.info('Validation score increased. Saving model ...')
         os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
-        torch.save(model.state_dict(), self.checkpoint_path)
+        torch.save(state_dict_for_save(model), self.checkpoint_path)
         self.best_saved_score = score
 
 

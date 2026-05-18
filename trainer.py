@@ -112,6 +112,11 @@ class PCVRHyFormerRankingTrainer:
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
+    @staticmethod
+    def _unwrap_model(model: nn.Module) -> nn.Module:
+        """Return the underlying module when ``model`` is torch.compile-wrapped."""
+        return getattr(model, '_orig_mod', model)
+
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
         ``global_step2500.layer=2.head=4.hidden=64[.best_model]``.
@@ -189,7 +194,10 @@ class PCVRHyFormerRankingTrainer:
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            torch.save(
+                self._unwrap_model(self.model).state_dict(),
+                os.path.join(ckpt_dir, "model.pt"),
+            )
         self._write_sidecar_files(ckpt_dir)
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
@@ -342,6 +350,9 @@ class PCVRHyFormerRankingTrainer:
                 self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
 
             self._handle_validation_result(total_step, val_auc, val_logloss)
+
+            # Persist one checkpoint per epoch (in addition to best-model saves).
+            self._save_step_checkpoint(total_step, is_best=False)
 
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")

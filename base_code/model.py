@@ -13,10 +13,13 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
-    time_feats: Optional[torch.Tensor]  # (B, 2), [hour(1..24), dow(1..7)]
+    sample_time_dense: torch.Tensor  # [B, sample_time_dim]
+    sample_time_buckets: torch.Tensor  # [B, sample_time_bucket_dim]
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_time_dense: dict  # {domain: tensor [B, L, seq_time_dense_dim]}
+    seq_time_discrete: dict  # {domain: tensor [B, K, L]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1191,7 +1194,14 @@ class RankMixerNSTokenizer(nn.Module):
 
 
 class UserPairEncoder(nn.Module):
-    """Encode aligned (user_int_id, user_dense_weight) pairs for fids 62-66."""
+    """Encode aligned ``(user_int_id, user_dense_weight)`` pairs.
+
+    The TAAC user features 62-66 are stored as two aligned tensors: the int
+    side carries categorical ids and the dense side carries the corresponding
+    per-slot weights. This encoder keeps that alignment instead of letting the
+    generic user-int mean pooling and user-dense projection model them
+    independently.
+    """
 
     def __init__(
         self,
@@ -1248,8 +1258,7 @@ class UserPairEncoder(nn.Module):
             )
 
         if use_hash_cross:
-            self.hash_emb = nn.Embedding(
-                self.hash_bucket_size + 1, pair_emb_dim, padding_idx=0)
+            self.hash_emb = nn.Embedding(self.hash_bucket_size + 1, pair_emb_dim, padding_idx=0)
             self.hash_proj = nn.Sequential(
                 nn.Linear(pair_emb_dim, d_model),
                 nn.LayerNorm(d_model),
@@ -1270,7 +1279,7 @@ class UserPairEncoder(nn.Module):
         spec: Dict[str, int],
         emb: nn.Embedding,
         rank_emb: Optional[nn.Embedding],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         int_offset = int(spec['int_offset'])
         dense_offset = int(spec['dense_offset'])
         length = int(spec['length'])
@@ -1321,8 +1330,7 @@ class UserPairEncoder(nn.Module):
             cross_vecs.append(cross_vec)
 
         if not cross_vecs:
-            return field_ids[0].new_zeros(
-                field_ids[0].shape[0], self.d_model, dtype=torch.float)
+            return field_ids[0].new_zeros(field_ids[0].shape[0], self.d_model, dtype=torch.float)
         hash_vec = torch.stack(cross_vecs, dim=1).mean(dim=1)
         return self.hash_proj(hash_vec)
 
@@ -1347,7 +1355,7 @@ class UserPairEncoder(nn.Module):
             field_log_weights.append(log_weights)
             field_masks.append(mask)
 
-        fid_stack = torch.stack(fid_vecs, dim=1)
+        fid_stack = torch.stack(fid_vecs, dim=1)  # [B, num_pair_fids, pair_emb_dim]
         tokens = [self.profile_proj(fid_stack.flatten(1)).unsqueeze(1)]
 
         if self.item_aware:
@@ -1362,8 +1370,7 @@ class UserPairEncoder(nn.Module):
             else:
                 query_input = item_pool
             query = self.item_query_proj(query_input)
-            attn_scores = (
-                fid_stack * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(self.pair_emb_dim)
+            attn_scores = (fid_stack * query.unsqueeze(1)).sum(dim=-1) / math.sqrt(self.pair_emb_dim)
             attn = torch.softmax(attn_scores, dim=1)
             item_pair_vec = (fid_stack * attn.unsqueeze(-1)).sum(dim=1)
             item_ctx = self.item_context_proj(item_pool)
@@ -1381,33 +1388,6 @@ class UserPairEncoder(nn.Module):
         return torch.cat(tokens, dim=1)
 
 
-class TimeNSTokenizer(nn.Module):
-    """Build one dedicated NS token from discrete request-time ids.
-
-    Expected input ``time_feats`` has shape ``(B, 2)`` with:
-      - ``time_feats[:, 0]``: hour id in [1, 24] (0 reserved for unknown)
-      - ``time_feats[:, 1]``: day-of-week id in [1, 7] (0 reserved for unknown)
-    """
-
-    def __init__(self, emb_dim: int, d_model: int) -> None:
-        super().__init__()
-        self.hour_emb = nn.Embedding(25, emb_dim, padding_idx=0)  # 0..24
-        self.dow_emb = nn.Embedding(8, emb_dim, padding_idx=0)    # 0..7
-        self.time_proj = nn.Sequential(
-            nn.Linear(emb_dim, d_model),
-            nn.LayerNorm(d_model),
-        )
-
-    def forward(self, time_feats: torch.Tensor) -> torch.Tensor:
-        if time_feats.dim() != 2 or time_feats.shape[1] != 2:
-            raise ValueError(
-                f"time_feats must have shape (B, 2), got {tuple(time_feats.shape)}")
-        hour_ids = time_feats[:, 0].long().clamp(min=0, max=24)
-        dow_ids = time_feats[:, 1].long().clamp(min=0, max=7)
-        time_emb = self.hour_emb(hour_ids) + self.dow_emb(dow_ids)  # (B, emb_dim)
-        return F.silu(self.time_proj(time_emb)).unsqueeze(1)  # (B, 1, d_model)
-
-
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1422,6 +1402,7 @@ class PCVRHyFormer(nn.Module):
         item_int_feature_specs: List[Tuple[int, int, int]],
         user_dense_dim: int,
         item_dense_dim: int,
+        sample_time_dim: int,
         seq_vocab_sizes: "dict[str, List[int]]",  # {domain: [vocab_size_per_fid, ...]}
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
@@ -1448,12 +1429,14 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
-        use_time_ns: bool = True,
+        sample_time_bucket_sizes: Optional[List[int]] = None,
+        seq_time_dense_dim: int = 0,
+        seq_time_bucket_sizes: Optional[List[int]] = None,
         user_pair_specs: Optional[List[Dict[str, int]]] = None,
         user_pair_emb_dim: int = 32,
-        user_pair_use_rank: bool = True,
-        user_pair_item_aware: bool = True,
-        user_pair_time_aware: bool = True,
+        user_pair_use_rank: bool = False,
+        user_pair_item_aware: bool = False,
+        user_pair_time_aware: bool = False,
         user_pair_use_hash_cross: bool = False,
         user_pair_hash_bucket_size: int = 200000,
         user_pair_hash_top_k: int = 3,
@@ -1472,7 +1455,10 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
-        self.use_time_ns = use_time_ns
+        self.sample_time_bucket_sizes = sample_time_bucket_sizes or []
+        self.seq_time_dense_dim = seq_time_dense_dim
+        self.seq_time_bucket_sizes = seq_time_bucket_sizes or []
+        self.user_pair_specs = user_pair_specs or []
 
         # ================== NS Tokens Construction ==================
 
@@ -1540,12 +1526,21 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
-        # Optional request-time discrete token.
-        if self.use_time_ns:
-            self.time_ns_tokenizer = TimeNSTokenizer(emb_dim=emb_dim, d_model=d_model)
+        # Per-sample request-time token (current hour/day/week context).
+        self.has_sample_time = sample_time_dim > 0
+        if self.has_sample_time:
+            self.sample_time_proj = nn.Sequential(
+                nn.Linear(sample_time_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+        self.has_sample_time_buckets = len(self.sample_time_bucket_sizes) > 0
+        if self.has_sample_time_buckets:
+            self.sample_time_bucket_embs = nn.ModuleList([
+                nn.Embedding(int(size), d_model, padding_idx=0)
+                for size in self.sample_time_bucket_sizes
+            ])
+            self.sample_time_bucket_norm = nn.LayerNorm(d_model)
 
-        self.user_pair_specs = user_pair_specs or []
-        self.user_pair_time_aware = user_pair_time_aware
         self.has_user_pair = len(self.user_pair_specs) > 0
         if self.has_user_pair:
             self.user_pair_encoder = UserPairEncoder(
@@ -1567,7 +1562,7 @@ class PCVRHyFormer(nn.Module):
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0)
-                       + (1 if self.use_time_ns else 0)
+                       + (1 if (self.has_sample_time or self.has_sample_time_buckets) else 0)
                        + num_user_pair_ns)
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
@@ -1627,6 +1622,30 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(len(vs) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+
+        self.has_seq_time_dense = seq_time_dense_dim > 0
+        if self.has_seq_time_dense:
+            self.seq_time_dense_proj = nn.ModuleDict({
+                domain: nn.Sequential(
+                    nn.Linear(seq_time_dense_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                for domain in self.seq_domains
+            })
+
+        self.has_seq_time_buckets = len(self.seq_time_bucket_sizes) > 0
+        if self.has_seq_time_buckets:
+            self.seq_time_bucket_embs = nn.ModuleDict({
+                domain: nn.ModuleList([
+                    nn.Embedding(int(size), d_model, padding_idx=0)
+                    for size in self.seq_time_bucket_sizes
+                ])
+                for domain in self.seq_domains
+            })
+            self.seq_time_bucket_norms = nn.ModuleDict({
+                domain: nn.LayerNorm(d_model)
+                for domain in self.seq_domains
+            })
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1722,6 +1741,17 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+        if self.has_sample_time_buckets:
+            for emb in self.sample_time_bucket_embs:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
+        if self.has_seq_time_buckets:
+            for domain in self.seq_domains:
+                for emb in self.seq_time_bucket_embs[domain]:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+
         if self.has_user_pair:
             for emb in self.user_pair_encoder.id_embs:
                 nn.init.xavier_normal_(emb.weight.data)
@@ -1789,6 +1819,13 @@ class PCVRHyFormer(nn.Module):
         # time_embedding is always preserved
         if self.num_time_buckets > 0:
             skip_count += 1
+        if self.has_sample_time_buckets:
+            skip_count += len(self.sample_time_bucket_embs)
+        if self.has_seq_time_buckets:
+            skip_count += sum(
+                len(self.seq_time_bucket_embs[domain])
+                for domain in self.seq_domains
+            )
         if self.has_user_pair:
             skip_count += len(self.user_pair_encoder.id_embs)
             skip_count += len(self.user_pair_encoder.rank_embs)
@@ -1812,14 +1849,39 @@ class PCVRHyFormer(nn.Module):
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
+    def _make_sample_time_token(
+        self,
+        dense_feats: torch.Tensor,
+        bucket_feats: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Project sample-level continuous/discrete request time into one NS token."""
+        parts = []
+        if self.has_sample_time:
+            parts.append(self.sample_time_proj(dense_feats))
+        if self.has_sample_time_buckets:
+            bucket_emb = None
+            for i, emb in enumerate(self.sample_time_bucket_embs):
+                e = emb(bucket_feats[:, i].long())
+                bucket_emb = e if bucket_emb is None else bucket_emb + e
+            parts.append(self.sample_time_bucket_norm(bucket_emb))
+        if not parts:
+            return None
+        token = parts[0]
+        for part in parts[1:]:
+            token = token + part
+        return F.silu(token).unsqueeze(1)
+
     def _embed_seq_domain(
         self,
+        domain: str,
         seq: torch.Tensor,
         sideinfo_embs: nn.ModuleList,
         proj: nn.Module,
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        seq_time_dense: Optional[torch.Tensor] = None,
+        seq_time_discrete: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1841,6 +1903,16 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        if self.has_seq_time_dense and seq_time_dense is not None:
+            token_emb = token_emb + F.gelu(self.seq_time_dense_proj[domain](seq_time_dense.float()))
+
+        if self.has_seq_time_buckets and seq_time_discrete is not None:
+            bucket_emb = None
+            for i, emb in enumerate(self.seq_time_bucket_embs[domain]):
+                e = emb(seq_time_discrete[:, i, :].long())
+                bucket_emb = e if bucket_emb is None else bucket_emb + e
+            token_emb = token_emb + self.seq_time_bucket_norms[domain](bucket_emb)
 
         return token_emb
 
@@ -1902,59 +1974,47 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
-    def _concat_ns_tokens(
-        self,
-        inputs: ModelInput,
-        user_ns: torch.Tensor,
-        item_ns: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build and concatenate all non-sequence NS tokens."""
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            ns_parts.append(
-                F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1))
-        ns_parts.append(item_ns)
-        if self.has_user_pair:
-            sample_time_token = None
-            if self.user_pair_time_aware and self.use_time_ns:
-                if inputs.time_feats is not None:
-                    sample_time_token = self.time_ns_tokenizer(
-                        inputs.time_feats).squeeze(1)
-            pair_tokens = self.user_pair_encoder(
-                inputs.user_int_feats,
-                inputs.user_dense_feats,
-                item_ns=item_ns,
-                sample_time_token=sample_time_token,
-            )
-            ns_parts.append(pair_tokens)
-        if self.has_item_dense:
-            ns_parts.append(
-                F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1))
-        if self.use_time_ns:
-            if inputs.time_feats is None:
-                time_tok = user_ns.new_zeros(user_ns.shape[0], 1, self.d_model)
-            else:
-                time_tok = self.time_ns_tokenizer(inputs.time_feats)
-            ns_parts.append(time_tok)
-        return torch.cat(ns_parts, dim=1)
-
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
-        ns_tokens = self._concat_ns_tokens(inputs, user_ns, item_ns)
+        ns_parts = [user_ns]
+        if self.has_user_dense:
+            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            ns_parts.append(user_dense_tok)
+        sample_time_tok = self._make_sample_time_token(
+            inputs.sample_time_dense, inputs.sample_time_buckets)
+        if sample_time_tok is not None:
+            ns_parts.append(sample_time_tok)
+        if self.has_user_pair:
+            pair_tokens = self.user_pair_encoder(
+                inputs.user_int_feats,
+                inputs.user_dense_feats,
+                item_ns=item_ns,
+                sample_time_token=sample_time_tok.squeeze(1) if sample_time_tok is not None else None,
+            )
+            ns_parts.append(pair_tokens)
+        ns_parts.append(item_ns)
+        if self.has_item_dense:
+            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            ns_parts.append(item_dense_tok)
+
+        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
+                domain,
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_time_dense.get(domain),
+                inputs.seq_time_discrete.get(domain))
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1974,18 +2034,44 @@ class PCVRHyFormer(nn.Module):
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
+        # Reuses forward logic but without dropout
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-        ns_tokens = self._concat_ns_tokens(inputs, user_ns, item_ns)
+
+        ns_parts = [user_ns]
+        if self.has_user_dense:
+            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            ns_parts.append(user_dense_tok)
+        sample_time_tok = self._make_sample_time_token(
+            inputs.sample_time_dense, inputs.sample_time_buckets)
+        if sample_time_tok is not None:
+            ns_parts.append(sample_time_tok)
+        if self.has_user_pair:
+            pair_tokens = self.user_pair_encoder(
+                inputs.user_int_feats,
+                inputs.user_dense_feats,
+                item_ns=item_ns,
+                sample_time_token=sample_time_tok.squeeze(1) if sample_time_tok is not None else None,
+            )
+            ns_parts.append(pair_tokens)
+        ns_parts.append(item_ns)
+        if self.has_item_dense:
+            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
+            ns_parts.append(item_dense_tok)
+
+        ns_tokens = torch.cat(ns_parts, dim=1)
 
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
+                domain,
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_time_dense.get(domain),
+                inputs.seq_time_discrete.get(domain))
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

@@ -26,7 +26,16 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    PCVRParquetDataset,
+    NUM_TIME_BUCKETS,
+    SAMPLE_TIME_DIM,
+    SAMPLE_TIME_BUCKET_DIM,
+    SAMPLE_TIME_BUCKET_SIZES,
+    SEQ_TIME_DENSE_DIM,
+    SEQ_TIME_BUCKET_SIZES,
+)
 from model import PCVRHyFormer, ModelInput
 
 
@@ -68,7 +77,11 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
-    'use_time_ns': True,
+    'sample_time_dim': SAMPLE_TIME_DIM,
+    'sample_time_bucket_sizes': SAMPLE_TIME_BUCKET_SIZES,
+    'seq_time_dense_dim': SEQ_TIME_DENSE_DIM,
+    'seq_time_bucket_sizes': SEQ_TIME_BUCKET_SIZES,
+    'user_pair_specs': [],
     'user_pair_emb_dim': 32,
     'user_pair_use_rank': True,
     'user_pair_item_aware': True,
@@ -102,6 +115,15 @@ def build_feature_specs(
     return specs
 
 
+def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
+    """Parse a string like ``'seq_a:256,seq_b:256,...'`` into a dict."""
+    seq_max_lens: Dict[str, int] = {}
+    for pair in sml_str.split(','):
+        k, v = pair.split(':')
+        seq_max_lens[k.strip()] = int(v.strip())
+    return seq_max_lens
+
+
 def _parse_int_list(value: str) -> List[int]:
     if not value:
         return []
@@ -131,28 +153,6 @@ def build_user_pair_specs(
             "length": int(int_len),
         })
     return specs
-
-
-def _normalize_state_dict_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Strip ``_orig_mod.`` prefix from checkpoints saved under ``torch.compile``."""
-    prefix = '_orig_mod.'
-    if not any(k.startswith(prefix) for k in state_dict):
-        return state_dict
-    logging.info(
-        'Checkpoint has torch.compile _orig_mod. keys; stripping prefix for load')
-    return {
-        (k[len(prefix):] if k.startswith(prefix) else k): v
-        for k, v in state_dict.items()
-    }
-
-
-def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
-    """Parse a string like ``'seq_a:256,seq_b:256,...'`` into a dict."""
-    seq_max_lens: Dict[str, int] = {}
-    for pair in sml_str.split(','):
-        k, v = pair.split(':')
-        seq_max_lens[k.strip()] = int(v.strip())
-    return seq_max_lens
 
 
 def load_train_config(model_dir: str) -> Dict[str, Any]:
@@ -187,6 +187,12 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
       2) ``train_config`` contains ``use_time_buckets`` (new-style training)
          -> derive as ``NUM_TIME_BUCKETS`` or ``0``;
       3) neither is present -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
+
+    The current training code also injects sample-level and sequence-level
+    time-feature constants directly into ``model_args`` rather than exposing
+    them as CLI flags, so older/newer ``train_config.json`` files may not
+    contain these keys. In that case infer derives them from ``infer/dataset.py``
+    constants to keep model construction identical to training.
     """
     cfg: Dict[str, Any] = {}
     for key in _MODEL_CFG_KEYS:
@@ -202,8 +208,17 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
                     f"using fallback = {cfg[key]}")
             continue
 
+        if key in {
+            'sample_time_dim',
+            'sample_time_bucket_sizes',
+            'seq_time_dense_dim',
+            'seq_time_bucket_sizes',
+        }:
+            cfg[key] = train_config.get(key, _FALLBACK_MODEL_CFG[key])
+            continue
+
         if key == 'user_pair_specs':
-            cfg[key] = train_config.get(key, [])
+            cfg[key] = train_config.get(key, _FALLBACK_MODEL_CFG[key])
             continue
 
         if key in train_config:
@@ -299,8 +314,7 @@ def load_model_state_strict(
     """Strictly load ``state_dict``; any missing/unexpected key fails fast
     with a diagnostic message.
     """
-    state_dict = _normalize_state_dict_keys(
-        torch.load(ckpt_path, map_location=device))
+    state_dict = torch.load(ckpt_path, map_location=device)
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
@@ -341,6 +355,8 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_time_dense: Dict[str, torch.Tensor] = {}
+    seq_time_discrete: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -348,16 +364,33 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_time_dense[domain] = device_batch.get(
+            f'{domain}_time_dense',
+            torch.zeros(B, L, 0, dtype=torch.float32, device=device)).float()
+        seq_time_discrete[domain] = device_batch.get(
+            f'{domain}_time_buckets',
+            torch.zeros(B, 0, L, dtype=torch.long, device=device))
+
+    B = device_batch['user_int_feats'].shape[0]
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
         user_dense_feats=device_batch['user_dense_feats'],
         item_dense_feats=device_batch['item_dense_feats'],
-        time_feats=device_batch.get('time_feats'),
+        sample_time_dense=device_batch.get(
+            'sample_time_dense',
+            torch.zeros(B, SAMPLE_TIME_DIM, dtype=torch.float32, device=device),
+        ).float(),
+        sample_time_buckets=device_batch.get(
+            'sample_time_buckets',
+            torch.zeros(B, SAMPLE_TIME_BUCKET_DIM, dtype=torch.long, device=device),
+        ),
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_time_dense=seq_time_dense,
+        seq_time_discrete=seq_time_discrete,
     )
 
 
@@ -390,13 +423,6 @@ def main() -> None:
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
 
-    # use_time_features 必须与训练时保持一致，否则 user_dense_dim 不同会导致
-    # state_dict 加载时 shape 不匹配。从 train_config.json 读取，默认 True。
-    use_time_features = bool(train_config.get('use_time_features', True))
-    use_time_ns = bool(train_config.get('use_time_ns', True))
-    logging.info(f"use_time_features: {use_time_features}")
-    logging.info(f"use_time_ns: {use_time_ns}")
-
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -405,19 +431,14 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
-        use_time_features=use_time_features,
-        use_time_ns=use_time_ns,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
 
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
-
-    use_user_pair = bool(train_config.get(
-        'use_user_pair', bool(model_cfg.get('user_pair_specs'))))
-    user_pair_fids = _parse_int_list(
-        train_config.get('user_pair_fids', '62,63,64,65,66'))
+    use_user_pair = bool(train_config.get('use_user_pair', bool(model_cfg.get('user_pair_specs'))))
+    user_pair_fids = _parse_int_list(train_config.get('user_pair_fids', '62,63,64,65,66'))
     model_cfg['user_pair_specs'] = (
         build_user_pair_specs(
             test_dataset.user_int_schema,
@@ -426,10 +447,8 @@ def main() -> None:
             user_pair_fids,
         )
         if use_user_pair and user_pair_fids
-        else train_config.get('user_pair_specs') or []
+        else []
     )
-    if model_cfg['user_pair_specs']:
-        logging.info(f"User pair specs: {model_cfg['user_pair_specs']}")
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the
@@ -465,12 +484,15 @@ def main() -> None:
     model.eval()
     logging.info("Model loaded successfully")
 
+    loader_kwargs: Dict[str, Any] = {}
+    if num_workers > 0:
+        loader_kwargs['prefetch_factor'] = 2
     test_loader = DataLoader(
         test_dataset,
         batch_size=None,
         num_workers=num_workers,
-        prefetch_factor=2,
         pin_memory=torch.cuda.is_available(),
+        **loader_kwargs,
     )
 
     all_probs = []
@@ -484,7 +506,7 @@ def main() -> None:
 
             logits, _ = model.predict(model_input)
             logits = logits.squeeze(-1)
-            probs = torch.sigmoid(logits.float()).cpu().numpy()
+            probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.extend(probs.tolist())
             all_user_ids.extend(user_ids)
 
