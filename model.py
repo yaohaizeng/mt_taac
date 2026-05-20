@@ -19,6 +19,20 @@ class ModelInput(NamedTuple):
     seq_time_buckets: dict  # {domain: tensor [B, L]}
 
 
+def hash_feature_ids(
+    raw_ids: torch.Tensor,
+    slot_index: int,
+    bucket_size: int,
+) -> torch.Tensor:
+    """Map raw feature ids to hash-bucket indices; padding id 0 stays 0."""
+    raw = raw_ids.long()
+    mask = raw > 0
+    hashed = (
+        raw * 1315423911 + (slot_index + 1) * 2654435761
+    ) % bucket_size + 1
+    return hashed * mask.long()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Rotary Position Embedding (RoPE)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -864,6 +878,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         num_ns: int,
         num_sequences: int,
         seq_encoder_type: str = 'swiglu',
+        seq_encoder_types: Optional[List[str]] = None,
         hidden_mult: int = 4,
         dropout: float = 0.0,
         top_k: int = 50,
@@ -875,10 +890,18 @@ class MultiSeqHyFormerBlock(nn.Module):
         self.num_queries = num_queries
         self.num_ns = num_ns
 
+        if seq_encoder_types is None:
+            seq_encoder_types = [seq_encoder_type] * num_sequences
+        if len(seq_encoder_types) != num_sequences:
+            raise ValueError(
+                f"seq_encoder_types length {len(seq_encoder_types)} != "
+                f"num_sequences {num_sequences}"
+            )
+
         # Independent sequence encoder per sequence
         self.seq_encoders = nn.ModuleList([
             create_sequence_encoder(
-                encoder_type=seq_encoder_type,
+                encoder_type=seq_encoder_types[i],
                 d_model=d_model,
                 num_heads=num_heads,
                 hidden_mult=hidden_mult,
@@ -886,7 +909,7 @@ class MultiSeqHyFormerBlock(nn.Module):
                 top_k=top_k,
                 causal=causal
             )
-            for _ in range(num_sequences)
+            for i in range(num_sequences)
         ])
 
         # Independent cross-attention per sequence
@@ -1433,6 +1456,7 @@ class PCVRHyFormer(nn.Module):
         num_hyformer_blocks: int = 2,
         num_heads: int = 4,
         seq_encoder_type: str = 'transformer',
+        seq_encoder_types: Optional[List[str]] = None,
         hidden_mult: int = 4,
         dropout_rate: float = 0.01,
         seq_top_k: int = 50,
@@ -1444,6 +1468,8 @@ class PCVRHyFormer(nn.Module):
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
+        seq_use_hash_emb: bool = True,
+        seq_hash_bucket_size: int = 200000,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1471,6 +1497,8 @@ class PCVRHyFormer(nn.Module):
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
+        self.seq_use_hash_emb = seq_use_hash_emb
+        self.seq_hash_bucket_size = int(seq_hash_bucket_size)
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_time_ns = use_time_ns
 
@@ -1590,14 +1618,23 @@ class PCVRHyFormer(nn.Module):
             """Create embedding list, returning None for features skipped via
             emb_skip_threshold or with no vocab info (vs<=0)."""
             embs_raw = []
-            for vs in vocab_sizes:
-                skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
-                if skip:
+            is_hash = []
+            for i, vs in enumerate(vocab_sizes):
+                skip = int(vs) <= 0 or (
+                    emb_skip_threshold > 0 and int(vs) > emb_skip_threshold
+                )
+                if skip and seq_use_hash_emb and int(vs) > 0:
                     embs_raw.append(None)
+                    is_hash.append(True)
+                elif skip:
+                    embs_raw.append(None)
+                    is_hash.append(False)
                 else:
-                    embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                    embs_raw.append(
+                        nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0)
+                    )
+                    is_hash.append(False)
             module_list = nn.ModuleList([e for e in embs_raw if e is not None])
-            # Map from position index to real index in module_list (-1 if skipped)
             index_map = []
             real_idx = 0
             for e in embs_raw:
@@ -1607,26 +1644,50 @@ class PCVRHyFormer(nn.Module):
                 else:
                     index_map.append(-1)
             is_id = [int(vs) > seq_id_threshold for vs in vocab_sizes]
-            return module_list, index_map, is_id
+            return module_list, index_map, is_id, is_hash
+
+        if seq_encoder_types is None:
+            seq_encoder_types = [seq_encoder_type] * self.num_sequences
+        if len(seq_encoder_types) != self.num_sequences:
+            raise ValueError(
+                f"seq_encoder_types length {len(seq_encoder_types)} != "
+                f"num_sequences {self.num_sequences}"
+            )
+        logging.info(f"Per-domain seq encoders: {dict(zip(self.seq_domains, seq_encoder_types))}")
+
+        if seq_use_hash_emb:
+            self.seq_hash_emb = nn.Embedding(
+                self.seq_hash_bucket_size + 1, emb_dim, padding_idx=0
+            )
+        else:
+            self.seq_hash_emb = None
 
         # ================== Dynamic Sequence Embeddings ==================
         self._seq_embs = nn.ModuleDict()
         self._seq_emb_index = {}    # domain -> index_map
         self._seq_is_id = {}        # domain -> is_id list
+        self._seq_is_hash = {}      # domain -> is_hash list
         self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
         self._seq_proj = nn.ModuleDict()
 
         for domain in self.seq_domains:
             vs = seq_vocab_sizes[domain]
-            embs, idx_map, is_id = _make_seq_embs(vs)
+            embs, idx_map, is_id, is_hash = _make_seq_embs(vs)
             self._seq_embs[domain] = embs
             self._seq_emb_index[domain] = idx_map
             self._seq_is_id[domain] = is_id
+            self._seq_is_hash[domain] = is_hash
             self._seq_vocab_sizes[domain] = vs
             self._seq_proj[domain] = nn.Sequential(
                 nn.Linear(len(vs) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+            hash_count = sum(is_hash)
+            if hash_count > 0:
+                logging.info(
+                    f"seq hash embedding: {domain} uses hash for {hash_count}/{len(vs)} "
+                    f"skipped side features (bucket_size={self.seq_hash_bucket_size})"
+                )
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1651,6 +1712,7 @@ class PCVRHyFormer(nn.Module):
                 num_ns=self.num_ns,
                 num_sequences=self.num_sequences,
                 seq_encoder_type=seq_encoder_type,
+                seq_encoder_types=seq_encoder_types,
                 hidden_mult=hidden_mult,
                 dropout=dropout_rate,
                 top_k=seq_top_k,
@@ -1721,6 +1783,10 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        if self.seq_hash_emb is not None:
+            nn.init.xavier_normal_(self.seq_hash_emb.weight.data)
+            self.seq_hash_emb.weight.data[0, :] = 0
 
         if self.has_user_pair:
             for emb in self.user_pair_encoder.id_embs:
@@ -1818,6 +1884,7 @@ class PCVRHyFormer(nn.Module):
         sideinfo_embs: nn.ModuleList,
         proj: nn.Module,
         is_id: List[bool],
+        is_hash: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
     ) -> torch.Tensor:
@@ -1826,8 +1893,16 @@ class PCVRHyFormer(nn.Module):
         emb_list = []
         for i in range(S):
             real_idx = emb_index[i] if i < len(emb_index) else -1
-            if real_idx == -1:
-                # Feature skipped by emb_skip_threshold: output zero vector
+            if real_idx == -1 and is_hash[i] and self.seq_hash_emb is not None:
+                raw_ids = seq[:, i, :].long()
+                hash_ids = hash_feature_ids(
+                    raw_ids, slot_index=i, bucket_size=self.seq_hash_bucket_size
+                )
+                e = self.seq_hash_emb(hash_ids)
+                if is_id[i] and self.training:
+                    e = self.seq_id_emb_dropout(e)
+                emb_list.append(e)
+            elif real_idx == -1:
                 emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
             else:
                 emb = sideinfo_embs[real_idx]
@@ -1953,7 +2028,8 @@ class PCVRHyFormer(nn.Module):
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
-                self._seq_is_id[domain], self._seq_emb_index[domain],
+                self._seq_is_id[domain], self._seq_is_hash[domain],
+                self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
@@ -1984,7 +2060,8 @@ class PCVRHyFormer(nn.Module):
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
-                self._seq_is_id[domain], self._seq_emb_index[domain],
+                self._seq_is_id[domain], self._seq_is_hash[domain],
+                self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])

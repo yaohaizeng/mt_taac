@@ -53,6 +53,57 @@ def _parse_int_list(value: str) -> List[int]:
     return [int(x.strip()) for x in value.split(',') if x.strip()]
 
 
+def _parse_kv_spec(value: str) -> Dict[str, str]:
+    """Parse ``key:value,key2:value2`` into a dict."""
+    result: Dict[str, str] = {}
+    if not value:
+        return result
+    for pair in value.split(','):
+        if ':' not in pair:
+            continue
+        k, v = pair.split(':', 1)
+        result[k.strip()] = v.strip()
+    return result
+
+
+def build_seq_encoder_types(
+    seq_domains: List[str],
+    default_type: str,
+    override_spec: Dict[str, str],
+) -> List[str]:
+    """Return per-domain encoder types in sorted domain order."""
+    return [override_spec.get(domain, default_type) for domain in sorted(seq_domains)]
+
+
+def estimate_num_ns_tokens(args, pcvr_dataset, user_pair_specs) -> int:
+    """Estimate NS token count for RankMixer T constraint checks."""
+    if args.ns_tokenizer_type == 'rankmixer':
+        num_user_ns = args.user_ns_tokens if args.user_ns_tokens > 0 else len(
+            pcvr_dataset.user_int_schema.entries
+        )
+        num_item_ns = args.item_ns_tokens if args.item_ns_tokens > 0 else len(
+            pcvr_dataset.item_int_schema.entries
+        )
+    else:
+        num_user_ns = len(pcvr_dataset.user_int_schema.entries)
+        num_item_ns = len(pcvr_dataset.item_int_schema.entries)
+
+    num_ns = (
+        num_user_ns
+        + (1 if pcvr_dataset.user_dense_schema.total_dim > 0 else 0)
+        + num_item_ns
+        + (1 if pcvr_dataset.item_dense_schema.total_dim > 0 else 0)
+        + (1 if args.use_time_ns else 0)
+    )
+    if user_pair_specs:
+        num_ns += 1
+        if args.user_pair_item_aware or args.user_pair_time_aware:
+            num_ns += 1
+        if args.user_pair_use_hash_cross:
+            num_ns += 1
+    return num_ns
+
+
 def build_user_pair_specs(
     schema: FeatureSchema,
     dense_schema: FeatureSchema,
@@ -164,11 +215,11 @@ def parse_args() -> argparse.Namespace:
     #   longer     — Top-K 压缩编码器，仅此变体使用 seq_top_k / seq_causal。
     parser.add_argument('--seq_encoder_type', type=str, default='transformer',
                         choices=['swiglu', 'transformer', 'longer'],
-                        help='Sequence encoder variant: '
-                             'swiglu = SwiGLU without attention, '
-                             'transformer = standard self-attention, '
-                             'longer = Top-K compressed encoder '
-                             '(only this variant consumes --seq_top_k / --seq_causal)')
+                        help='Default sequence encoder for all domains when '
+                             'not overridden by --seq_encoder_types')
+    parser.add_argument('--seq_encoder_types', type=str, default='',
+                        help='Per-domain encoder overrides, e.g. '
+                             'seq_d:longer,seq_a:transformer')
     parser.add_argument('--hidden_mult', type=int, default=4,
                         help='FFN inner-dim multiplier relative to d_model')
     parser.add_argument('--dropout_rate', type=float, default=0.01,
@@ -270,6 +321,14 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
+    parser.add_argument('--seq_use_hash_emb', action='store_true', default=True,
+                        help='Use shared hash embedding for seq side features skipped '
+                             'by emb_skip_threshold (default on)')
+    parser.add_argument('--no_seq_use_hash_emb', dest='seq_use_hash_emb',
+                        action='store_false',
+                        help='Disable hash embedding for skipped seq side features')
+    parser.add_argument('--seq_hash_bucket_size', type=int, default=200000,
+                        help='Hash bucket size for skipped seq side features')
 
     # ns_groups_json 默认指向项目根目录下的 ns_groups.json；
     # 若文件不存在，后续逻辑会退化为每个特征独立成组（singleton group）。
@@ -484,6 +543,15 @@ def main() -> None:
     if user_pair_specs:
         logging.info(f"User pair specs: {user_pair_specs}")
 
+    seq_encoder_type_overrides = _parse_kv_spec(args.seq_encoder_types)
+    seq_encoder_types_list = build_seq_encoder_types(
+        pcvr_dataset.seq_domains,
+        args.seq_encoder_type,
+        seq_encoder_type_overrides,
+    )
+    if seq_encoder_type_overrides:
+        logging.info(f"Seq encoder overrides: {dict(zip(sorted(pcvr_dataset.seq_domains), seq_encoder_types_list))}")
+
     model_args = {
         # 特征规格：整型 Embedding 表描述符 + Dense 维度
         "user_int_feature_specs": user_int_feature_specs,
@@ -503,6 +571,7 @@ def main() -> None:
         "num_heads": args.num_heads,
         # 序列编码器变体及相关参数
         "seq_encoder_type": args.seq_encoder_type,
+        "seq_encoder_types": seq_encoder_types_list,
         "hidden_mult": args.hidden_mult,
         "dropout_rate": args.dropout_rate,
         "seq_top_k": args.seq_top_k,
@@ -520,6 +589,8 @@ def main() -> None:
         "emb_skip_threshold": args.emb_skip_threshold,
         # 序列 id 特征额外 dropout 阈值
         "seq_id_threshold": args.seq_id_threshold,
+        "seq_use_hash_emb": args.seq_use_hash_emb,
+        "seq_hash_bucket_size": args.seq_hash_bucket_size,
         # NS Tokenizer 变体及 rankmixer 模式的 token 数
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
@@ -542,19 +613,7 @@ def main() -> None:
     else:
         num_user_ns = len(user_ns_groups)
         num_item_ns = len(item_ns_groups)
-    estimated_num_ns = (
-        num_user_ns
-        + (1 if pcvr_dataset.user_dense_schema.total_dim > 0 else 0)
-        + num_item_ns
-        + (1 if pcvr_dataset.item_dense_schema.total_dim > 0 else 0)
-        + (1 if args.use_time_ns else 0)
-    )
-    if user_pair_specs:
-        estimated_num_ns += 1
-        if args.user_pair_item_aware or args.user_pair_time_aware:
-            estimated_num_ns += 1
-        if args.user_pair_use_hash_cross:
-            estimated_num_ns += 1
+    estimated_num_ns = estimate_num_ns_tokens(args, pcvr_dataset, user_pair_specs)
     estimated_T = args.num_queries * len(pcvr_dataset.seq_domains) + estimated_num_ns
     if (model_args["rank_mixer_mode"] == 'full'
             and args.d_model % estimated_T != 0):

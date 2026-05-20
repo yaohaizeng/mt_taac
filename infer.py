@@ -54,6 +54,7 @@ _FALLBACK_MODEL_CFG = {
     'num_hyformer_blocks': 2,
     'num_heads': 4,
     'seq_encoder_type': 'transformer',
+    'seq_encoder_types': None,
     'hidden_mult': 4,
     'dropout_rate': 0.01,
     'seq_top_k': 50,
@@ -65,6 +66,8 @@ _FALLBACK_MODEL_CFG = {
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,
     'seq_id_threshold': 10000,
+    'seq_use_hash_emb': True,
+    'seq_hash_bucket_size': 200000,
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
@@ -144,6 +147,26 @@ def _normalize_state_dict_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
         (k[len(prefix):] if k.startswith(prefix) else k): v
         for k, v in state_dict.items()
     }
+
+
+def _parse_kv_spec(value: str) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    if not value:
+        return result
+    for pair in value.split(','):
+        if ':' not in pair:
+            continue
+        k, v = pair.split(':', 1)
+        result[k.strip()] = v.strip()
+    return result
+
+
+def _build_seq_encoder_types(
+    seq_domains: List[str],
+    default_type: str,
+    override_spec: Dict[str, str],
+) -> List[str]:
+    return [override_spec.get(domain, default_type) for domain in sorted(seq_domains)]
 
 
 def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
@@ -277,6 +300,18 @@ def build_model(
         dataset.item_int_schema, dataset.item_int_vocab_sizes)
 
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
+    model_cfg = dict(model_cfg)
+    encoder_types = model_cfg.get('seq_encoder_types')
+    if isinstance(encoder_types, str):
+        overrides = _parse_kv_spec(encoder_types)
+        model_cfg['seq_encoder_types'] = _build_seq_encoder_types(
+            dataset.seq_domains,
+            model_cfg.get('seq_encoder_type', 'transformer'),
+            overrides,
+        )
+    elif encoder_types is None:
+        model_cfg['seq_encoder_types'] = None
+
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
         item_int_feature_specs=item_int_feature_specs,
